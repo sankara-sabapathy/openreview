@@ -1,6 +1,6 @@
 {
   "name": "openreview",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Free, open-source, BYOK multi-provider multi-agent PR reviewer. Config: .github/openreview.yml",
   "type": "module",
   "main": "dist/index.js",
