@@ -38,6 +38,7 @@ providers:
     model: kimi-k2.7-code
     base_url: https://opencode.ai/zen/go/v1
     key_from: secrets.OPENCODE_API_KEY
+    extra_body: { temperature: 1 } # kimi rejects temperature != 1
 
   # --- Commented examples: any provider works with protocol + base_url + key_from + model ---
   # claude:
