@@ -32,6 +32,13 @@ providers:
     # json_mode: true # set false for providers rejecting response_format
     # extra_body: { temperature: 0.1 } # extra JSON body fields merged into requests
 
+  # --- Ballot demo (temporary): second model on the same Go key = second ballot ---
+  kimi:
+    protocol: openai-chat
+    model: kimi-k2.7-code
+    base_url: https://opencode.ai/zen/go/v1
+    key_from: secrets.OPENCODE_API_KEY
+
   # --- Commented examples: any provider works with protocol + base_url + key_from + model ---
   # claude:
   #   protocol: anthropic-messages
@@ -59,7 +66,7 @@ reviews:
   # --- Active review: everything in this repo gets the general pass ---
   - id: general-quality
     if_paths: ["**"]
-    # strategy: any # accepted but currently ignored; see issue #12
+    strategy: majority # ballot demo: glm (main) vs kimi (subagent)
     main:
       # name: defaults to "<review-id>:main"
       provider: opencode
@@ -67,7 +74,7 @@ reviews:
       # max_files: 50 # reserved; currently unused
     subagents:
       - name: correctness
-        provider: opencode
+        provider: kimi
         instructions: "Bugs, races, missing tests."
     verdict:
       mode: comment # comment | approve | request_changes
