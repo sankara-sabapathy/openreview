@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync, symlinkSync, rmSync } from "node:fs";
+import { mkdtempSync, writeFileSync, symlinkSync, rmSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import { extractDefinedNames, buildContextBlock } from "./context.js";
@@ -42,6 +42,32 @@ describe("buildContextBlock", () => {
       ignore: [],
     });
     assert.ok(!r.block.includes("full file: evil.ts"));
+  });
+
+  it("never escapes through a symlinked directory", () => {
+    const outside = dir + "-outside";
+    try {
+      mkdirSync(outside, { recursive: true });
+      writeFileSync(path.join(outside, "secret.txt"), "top-secret");
+      symlinkSync(outside, path.join(dir, "linkdir"));
+    } catch {
+      return; // symlinks unavailable on this platform
+    }
+    try {
+      const r = buildContextBlock({
+        repoRoot: dir,
+        scopedFiles: ["real.ts"],
+        contextFiles: ["linkdir/secret.txt"],
+        includeFullFiles: false,
+        maxContextChars: 20000,
+        ignore: [],
+      });
+      assert.ok(!r.block.includes("top-secret"));
+      assert.ok(r.stats.includes("linkdir/secret.txt"));
+    } finally {
+      rmSync(outside, { recursive: true, force: true });
+      rmSync(path.join(dir, "linkdir"), { force: true });
+    }
   });
 
   it("warns on missing explicit context files", () => {

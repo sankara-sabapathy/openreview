@@ -30,6 +30,7 @@ providers:
     # json_mode: false                     # drop response_format for strict APIs
     # extra_body: { temperature: 0.1 }     # merged into request JSON
     # retries: 2                           # retry budget for empty/5xx/429/network (0-5)
+    # timeout_s: 110                       # per-attempt HTTP timeout, seconds
 
 reviews:
   - id: general-quality
@@ -51,8 +52,9 @@ reviews:
 
 Agents receive more than hunks: the full content of changed in-scope files (each
 capped at 12KB), plus call-site excerpts for top-level symbols those files define
-(who imports/calls them elsewhere), plus any `context_files` globs — all inside a
-`<context>` block bounded by `max_context_chars` (default 20KB, `0` disables). Findings must ground in the diff; context is
+(who imports/calls them elsewhere — changed files themselves are never cited as
+callers), plus any `context_files` globs — all inside a `<context>` block bounded
+by `max_context_chars` (default 20KB, `0` disables everything including excerpts). Findings must ground in the diff; context is
 evidence only (agents are instructed never to flag context-only code).
 
 ```yaml

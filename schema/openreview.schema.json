@@ -51,6 +51,7 @@
           "endpoint_path": { "type": "string" },
           "json_mode": { "type": "boolean" },
           "retries": { "type": "integer", "minimum": 0, "maximum": 5 },
+          "timeout_s": { "type": "integer", "minimum": 10, "maximum": 600 },
           "extra_body": { "type": "object" }
         }
       }

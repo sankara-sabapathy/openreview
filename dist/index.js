@@ -45232,14 +45232,6 @@ const SKIP_EXT = new Set([
     ".ttf",
     ".ico",
 ]);
-function isSymlink(full) {
-    try {
-        return (0,external_node_fs_namespaceObject.lstatSync)(full).isSymbolicLink();
-    }
-    catch {
-        return true; // unreadable -> treat as unusable
-    }
-}
 function walkFiles(root, ignore, out = []) {
     let entries;
     try {
@@ -45250,8 +45242,15 @@ function walkFiles(root, ignore, out = []) {
     }
     for (const e of entries) {
         const full = external_node_path_namespaceObject.join(root, e);
-        if (isSymlink(full))
-            continue; // never follow symlinks (exfiltration risk)
+        // Never descend into or through symlinks: lstat the link itself, so a
+        // symlinked intermediate directory can never escape the repo.
+        try {
+            if ((0,external_node_fs_namespaceObject.lstatSync)(full).isSymbolicLink())
+                continue;
+        }
+        catch {
+            continue;
+        }
         let st;
         try {
             st = (0,external_node_fs_namespaceObject.statSync)(full);
@@ -45285,14 +45284,28 @@ function walkFiles(root, ignore, out = []) {
 }
 function readCapped(root, rel, cap) {
     const full = external_node_path_namespaceObject.resolve(root, rel);
-    // Containment: never read outside the repo (config + file list are PR-controlled).
-    const normRoot = external_node_path_namespaceObject.resolve(root) + external_node_path_namespaceObject.sep;
-    if (full !== external_node_path_namespaceObject.resolve(root) && !full.startsWith(normRoot))
-        return null;
-    if (isSymlink(full))
-        return null; // never read through symlinks
+    // Containment on the REAL path (resolves symlinked intermediate dirs too, and
+    // the root itself — e.g. /tmp -> /private/tmp on macOS):
+    // never read outside the repo (config + file list are PR-controlled).
+    let realRoot;
     try {
-        const content = (0,external_node_fs_namespaceObject.readFileSync)(full, "utf8");
+        realRoot = (0,external_node_fs_namespaceObject.realpathSync)(external_node_path_namespaceObject.resolve(root));
+    }
+    catch {
+        return null;
+    }
+    let real;
+    try {
+        real = (0,external_node_fs_namespaceObject.realpathSync)(full);
+    }
+    catch {
+        return null;
+    }
+    const normRoot = realRoot + external_node_path_namespaceObject.sep;
+    if (real !== realRoot && !real.startsWith(normRoot))
+        return null;
+    try {
+        const content = (0,external_node_fs_namespaceObject.readFileSync)(real, "utf8");
         return content.length > cap ? content.slice(0, cap) + "\n...[file truncated]" : content;
     }
     catch {
@@ -45474,15 +45487,21 @@ function buildContextBlock(input) {
             }
         }
     }
-    // 3. Call-site excerpts for defined symbols (outside their own file,
-    // skipping comment-only matches).
+    // 3. Call-site excerpts for defined symbols. Changed files are never caller
+    // candidates (their content is already in the prompt or the diff); each file
+    // is emitted at most once.
     if (changedContents.size > 0) {
-        const candidates = all.filter((f) => !pushed.has(f)).slice(0, 400);
+        const candidates = all
+            .filter((f) => !changedContents.has(f) && !pushed.has(f))
+            .slice(0, 400);
+        const emitted = new Set();
         const fileContents = new Map();
-        for (const [file, content] of changedContents) {
+        for (const content of changedContents.values()) {
             for (const name of extractDefinedNames(content)) {
                 const word = new RegExp(`\\b${name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`);
                 for (const other of candidates) {
+                    if (emitted.has(other))
+                        continue;
                     let otherContent = fileContents.get(other);
                     if (otherContent === undefined) {
                         otherContent = readCapped(input.repoRoot, other, 60000) ?? "";
@@ -45491,8 +45510,10 @@ function buildContextBlock(input) {
                     const hits = findCodeMatches(otherContent, word, 2);
                     if (hits.length > 0) {
                         const excerpt = excerptAround(otherContent, hits[0]);
-                        if (push(`--- callers of ${name} in ${other} ---\n${excerpt}`))
+                        if (push(`--- callers of ${name} in ${other} ---\n${excerpt}`)) {
                             callerCount++;
+                            emitted.add(other);
+                        }
                         else
                             break;
                     }
