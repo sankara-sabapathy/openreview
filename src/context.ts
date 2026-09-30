@@ -1,4 +1,4 @@
-import { readFileSync, existsSync, readdirSync, statSync, lstatSync, realpathSync } from "node:fs";
+import { readFileSync, readdirSync, statSync, lstatSync, realpathSync } from "node:fs";
 import * as path from "node:path";
 import * as core from "@actions/core";
 import { matchesAny } from "./reviewer.js";

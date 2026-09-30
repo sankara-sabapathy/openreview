@@ -1,6 +1,6 @@
-import { describe, it } from "node:test";
+import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync, symlinkSync, rmSync, mkdirSync } from "node:fs";
+import { mkdtempSync, writeFileSync, symlinkSync, rmSync, mkdirSync, existsSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import * as path from "node:path";
 import { extractDefinedNames, buildContextBlock } from "./context.js";
@@ -24,15 +24,29 @@ describe("extractDefinedNames", () => {
 });
 
 describe("buildContextBlock", () => {
-  const dir = mkdtempSync(path.join(tmpdir(), "or-ctx-"));
-  writeFileSync(path.join(dir, "real.ts"), "export function hello() { return 1; }\n");
-  try {
-    symlinkSync("/etc/hostname", path.join(dir, "evil.ts"));
-  } catch {
-    // symlink creation may fail on some platforms; test skips that part then
-  }
+  let dir: string;
+  before(() => {
+    dir = mkdtempSync(path.join(tmpdir(), "or-ctx-"));
+    writeFileSync(path.join(dir, "real.ts"), "export function hello() { return 1; }\n");
+    try {
+      symlinkSync("/etc/hostname", path.join(dir, "evil.ts"));
+    } catch {
+      // symlinks unavailable on some platforms; related tests assert accordingly
+    }
+  });
+  after(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
 
   it("never follows symlinks", () => {
+    const link = path.join(dir, "evil.ts");
+    if (!existsSync(link)) return; // symlinks unavailable on this platform
+    let targetContent = "";
+    try {
+      targetContent = readFileSync("/etc/hostname", "utf8").trim();
+    } catch {
+      // unreadable target; the exclusion assertion below still holds
+    }
     const r = buildContextBlock({
       repoRoot: dir,
       scopedFiles: ["real.ts", "evil.ts"],
@@ -42,6 +56,7 @@ describe("buildContextBlock", () => {
       ignore: [],
     });
     assert.ok(!r.block.includes("full file: evil.ts"));
+    if (targetContent) assert.ok(!r.block.includes(targetContent));
   });
 
   it("never escapes through a symlinked directory", () => {
@@ -105,7 +120,6 @@ describe("buildContextBlock", () => {
     });
     assert.ok(r.block.length <= 700);
   });
-  rmSync(dir, { recursive: true, force: true });
 });
 
 describe("ballots", () => {
