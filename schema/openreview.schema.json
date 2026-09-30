@@ -48,6 +48,7 @@
           "headers": { "type": "object", "additionalProperties": { "type": "string" } },
           "endpoint_path": { "type": "string" },
           "json_mode": { "type": "boolean" },
+          "retries": { "type": "integer", "minimum": 0, "maximum": 5 },
           "extra_body": { "type": "object" }
         }
       }

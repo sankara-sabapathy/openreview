@@ -40,6 +40,9 @@ export const ProviderConfig = z.object({
   // Endpoint path appended to base_url. Defaults: "/chat/completions" (openai-chat),
   // "/v1/messages" (anthropic-messages).
   endpoint_path: z.string().optional(),
+  // Retry budget for transient failures (empty content, 5xx, 429, network).
+  // Total failure throws into the PR's agent-error block instead of silent empty.
+  retries: z.number().int().min(0).max(5).default(2),
   // Send response_format json_object (openai-chat). Disable for providers that reject it.
   json_mode: z.boolean().default(true),
   // Extra JSON body fields merged into the request (provider-specific params).

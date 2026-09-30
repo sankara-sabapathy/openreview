@@ -44516,6 +44516,9 @@ const ProviderConfig = objectType({
     // Endpoint path appended to base_url. Defaults: "/chat/completions" (openai-chat),
     // "/v1/messages" (anthropic-messages).
     endpoint_path: stringType().optional(),
+    // Retry budget for transient failures (empty content, 5xx, 429, network).
+    // Total failure throws into the PR's agent-error block instead of silent empty.
+    retries: numberType().int().min(0).max(5).default(2),
     // Send response_format json_object (openai-chat). Disable for providers that reject it.
     json_mode: booleanType().default(true),
     // Extra JSON body fields merged into the request (provider-specific params).
@@ -44843,37 +44846,70 @@ function resolveProvider(provider, keys, env, sessionId) {
         extraBody: provider.extra_body ?? {},
     };
 }
+function sleep(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+}
+/** Retryable: empty responses, HTTP 429/5xx, transport failures. Never 4xx auth/shape errors. */
+function isRetryableError(message) {
+    return /empty (content|response)| 429[:\s]| 5\d\d[:\s]|fetch failed|timeout|ECONNRESET|ENOTFOUND|socket hang up/i.test(message);
+}
 async function runAgent(opts) {
     const system = SYSTEM_WRAPPER(opts.lang, opts.instructions);
     const user = `Review this unified diff (truncated):\n\n${truncate(opts.diff, opts.maxDiffChars)}`;
     const rp = resolveProvider(opts.provider, opts.keys, process.env, opts.sessionId);
     if (!rp.apiKey)
         return []; // missing BYOK key -> skip silently, caller warns
-    let raw;
-    if (rp.protocol === "anthropic-messages") {
-        raw = await callAnthropic({
-            apiKey: rp.apiKey,
-            baseUrl: rp.baseUrl,
-            endpointPath: rp.endpointPath,
-            headers: rp.headers,
-            model: opts.provider.model,
-            system,
-            user,
-            extraBody: rp.extraBody,
-        });
+    // Retry budget (issue #30): transient empties/5xx must not silently approve.
+    const maxAttempts = 1 + Math.min(Math.max(opts.provider.retries ?? 2, 0), 5);
+    let raw = "";
+    let lastError = "";
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+        try {
+            if (rp.protocol === "anthropic-messages") {
+                raw = await callAnthropic({
+                    apiKey: rp.apiKey,
+                    baseUrl: rp.baseUrl,
+                    endpointPath: rp.endpointPath,
+                    headers: rp.headers,
+                    model: opts.provider.model,
+                    system,
+                    user,
+                    extraBody: rp.extraBody,
+                });
+            }
+            else {
+                raw = await callOpenAICompatible({
+                    apiKey: rp.apiKey,
+                    baseUrl: rp.baseUrl,
+                    endpointPath: rp.endpointPath,
+                    headers: rp.headers,
+                    model: opts.provider.model,
+                    system,
+                    user,
+                    jsonMode: rp.jsonMode,
+                    extraBody: rp.extraBody,
+                });
+            }
+            if (raw && raw.trim())
+                break; // success
+            lastError = `empty content from ${opts.provider.model}`;
+            raw = "";
+        }
+        catch (e) {
+            lastError = e.message;
+            raw = "";
+        }
+        if (attempt < maxAttempts && isRetryableError(lastError)) {
+            core.warning(`Agent ${opts.agentName}: attempt ${attempt}/${maxAttempts} failed (${lastError.slice(0, 160)}); retrying`);
+            await sleep(2000 * attempt);
+        }
+        else if (attempt < maxAttempts) {
+            break; // non-retryable (auth/shape) — fail fast
+        }
     }
-    else {
-        raw = await callOpenAICompatible({
-            apiKey: rp.apiKey,
-            baseUrl: rp.baseUrl,
-            endpointPath: rp.endpointPath,
-            headers: rp.headers,
-            model: opts.provider.model,
-            system,
-            user,
-            jsonMode: rp.jsonMode,
-            extraBody: rp.extraBody,
-        });
+    if (!raw.trim()) {
+        // Total failure surfaces into the PR's agent-error block (main.ts catch).
+        throw new Error(`Agent ${opts.agentName} failed after ${maxAttempts} attempt(s): ${lastError}`);
     }
     const parsed = extractFindingsJson(raw);
     if (!parsed) {

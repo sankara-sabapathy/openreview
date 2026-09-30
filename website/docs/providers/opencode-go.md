@@ -48,6 +48,14 @@ requires for routing/prompt-caching. Only `chat/completions`-listed models work
 
 Usage beyond limits blocks unless **Use balance** (Zen credits) is enabled in the console.
 
+> **Known flake (2026-09-30, [issue #30](https://github.com/sankara-sabapathy/openreview/issues/30)):**
+> `glm-5.3-flash` intermittently returns **empty content** (upstream thinking
+> degeneration + gateway 500/503/524s — see [opencode#45533](https://github.com/anomalyco/opencode/issues/45533),
+> [#36889](https://github.com/anomalyco/opencode/issues/36889)). OpenReview retries
+> empties/5xx/429s (`retries:`, default 2) and surfaces total failure in the PR's
+> error block instead of silently approving. For default reviewers we currently
+> recommend `kimi-k2.7-code` (reliable in live runs; needs `extra_body: {temperature: 1}`).
+
 > **Model quirk found by dogfood:** `kimi-k2.7-code` rejects any `temperature`
 > other than `1` (OpenReview defaults to `0.2`). Override per provider:
 > `extra_body: { temperature: 1 }`. If a new model 400s on a parameter, the PR's

@@ -24,13 +24,14 @@ defaults:
   max_diff_chars: 80000
 
 providers:
-  # --- Active: OpenCode Go subscription (this repo's own reviews) ---
+  # --- Active: OpenCode Go (kimi proved reliable live; glm-5.3-flash flaked
+  # --- with empty content 4x — see issue #30). Both use the same Go key. ---
   opencode:
     # kind: is a deprecated shorthand (anthropic|openai|opencode|openai-compatible).
     # Prefer protocol below; both are shown here for reference.
     kind: opencode
     protocol: openai-chat # openai-chat | anthropic-messages
-    model: glm-5.3-flash
+    model: kimi-k2.7-code
     base_url: https://opencode.ai/zen/go/v1
     key_from: secrets.OPENCODE_API_KEY # any $NAME: "secrets.FOO" | "env.FOO"
     # auth: { header: Authorization, scheme: Bearer } # defaults shown; Azure uses { header: api-key, scheme: "" }
@@ -38,6 +39,8 @@ providers:
     # endpoint_path: /chat/completions # default per protocol (/chat/completions, /v1/messages)
     # json_mode: true # set false for providers rejecting response_format
     # extra_body: { temperature: 0.1 } # extra JSON body fields merged into requests
+    extra_body: { temperature: 1 } # kimi rejects temperature != 1
+    # retries: 2 # attempts after the first for empty/5xx/429/network (0-5)
 
   # --- Commented examples: any provider works with protocol + base_url + key_from + model ---
   # Claude subscription (Pro/Max/…): `claude setup-token` → secret → step env.

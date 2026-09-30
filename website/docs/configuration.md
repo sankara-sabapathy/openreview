@@ -27,6 +27,7 @@ providers:
     # endpoint_path: /chat/completions     # default per protocol
     # json_mode: false                     # drop response_format for strict APIs
     # extra_body: { temperature: 0.1 }     # merged into request JSON
+    # retries: 2                           # retry budget for empty/5xx/429/network (0-5)
 
 reviews:
   - id: general-quality
