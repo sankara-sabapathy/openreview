@@ -70,7 +70,7 @@ reviews:
         provider: opencode
         instructions: "Bugs, races, missing tests."
     verdict:
-      mode: comment # comment | approve | request_changes
+      mode: request_changes # BLOCKING DEMO (temporary): request_changes instead of comment
       min_severity: medium # suggestion | medium | high
       post_inline: true
       deduplicate: true
@@ -93,4 +93,4 @@ reviews:
 global_verdict:
   strategy: any_blocking # any_blocking | max_severity | majority
   sticky_comment: true
-  fail_check_on_request_changes: false
+  fail_check_on_request_changes: true # BLOCKING DEMO (temporary): red CI check on request_changes
