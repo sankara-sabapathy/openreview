@@ -32,6 +32,15 @@ providers:
     # json_mode: true # set false for providers rejecting response_format
     # extra_body: { temperature: 0.1 } # extra JSON body fields merged into requests
 
+  # --- Blocking demo (temporary): kimi proved reliable in PR #14; glm has been
+  # --- returning empty findings since ~07:51 UTC (gateway-side, investigating) ---
+  kimi:
+    protocol: openai-chat
+    model: kimi-k2.7-code
+    base_url: https://opencode.ai/zen/go/v1
+    key_from: secrets.OPENCODE_API_KEY
+    extra_body: { temperature: 1 } # kimi rejects temperature != 1
+
   # --- Commented examples: any provider works with protocol + base_url + key_from + model ---
   # claude:
   #   protocol: anthropic-messages
@@ -62,12 +71,12 @@ reviews:
     strategy: any # any | all | majority: per-provider ballots; see website/docs/multi-review
     main:
       # name: defaults to "<review-id>:main"
-      provider: opencode
+      provider: kimi
       instructions: "Synthesize findings. Strict on bugs, lenient on style."
       # max_files: 50 # reserved; currently unused
     subagents:
       - name: correctness
-        provider: opencode
+        provider: kimi
         instructions: "Bugs, races, missing tests."
     verdict:
       mode: request_changes # BLOCKING DEMO (temporary): request_changes instead of comment
