@@ -17,6 +17,7 @@ jobs:
       - run: npm ci || npm install
       - run: npm run typecheck
       - run: npm run build
+      - run: npm test
       - run: npm run package
       - name: Check dist/ has no stray chunks (ncc must emit a single index.js)
         run: |

@@ -52,26 +52,38 @@ async function callAnthropic(opts: {
   system: string;
   user: string;
   extraBody: Record<string, unknown>;
+  timeoutMs: number;
 }): Promise<string> {
   const base = opts.baseUrl.replace(/\/$/, "");
-  const res = await fetch(`${base}${opts.endpointPath}`, {
-    method: "POST",
-    headers: opts.headers,
-    body: JSON.stringify({
-      model: opts.model,
-      max_tokens: 2000,
-      system: opts.system,
-      messages: [{ role: "user", content: opts.user }],
-      ...opts.extraBody,
-    }),
-  });
-  if (!res.ok) throw new Error(`anthropic ${res.status}: ${await res.text()}`);
-  const j = (await res.json()) as any;
-  const text = (j.content ?? [])
-    .filter((b: any) => b.type === "text")
-    .map((b: any) => b.text)
-    .join("\n");
-  return text;
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), opts.timeoutMs);
+  try {
+    const res = await fetch(`${base}${opts.endpointPath}`, {
+      method: "POST",
+      headers: opts.headers,
+      body: JSON.stringify({
+        model: opts.model,
+        max_tokens: 2000,
+        system: opts.system,
+        messages: [{ role: "user", content: opts.user }],
+        ...opts.extraBody,
+      }),
+      signal: ctrl.signal,
+    });
+    if (!res.ok) throw new Error(`anthropic ${res.status}: ${await res.text()}`);
+    const j = (await res.json()) as any;
+    const text = (j.content ?? [])
+      .filter((b: any) => b.type === "text")
+      .map((b: any) => b.text)
+      .join("\n");
+    return text;
+  } catch (e) {
+    if ((e as Error).name === "AbortError")
+      throw new Error(`timeout after ${opts.timeoutMs}ms`);
+    throw e;
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 async function callOpenAICompatible(opts: {
@@ -84,6 +96,7 @@ async function callOpenAICompatible(opts: {
   user: string;
   jsonMode: boolean;
   extraBody: Record<string, unknown>;
+  timeoutMs: number;
 }): Promise<string> {
   const base = opts.baseUrl.replace(/\/$/, "");
   const body: Record<string, unknown> = {
@@ -97,14 +110,25 @@ async function callOpenAICompatible(opts: {
     ...opts.extraBody,
   };
   if (opts.jsonMode) body.response_format = { type: "json_object" };
-  const res = await fetch(`${base}${opts.endpointPath}`, {
-    method: "POST",
-    headers: opts.headers,
-    body: JSON.stringify(body),
-  });
-  if (!res.ok) throw new Error(`llm ${base} ${res.status}: ${await res.text()}`);
-  const j = (await res.json()) as any;
-  return j.choices?.[0]?.message?.content ?? '{"findings":[]}';
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), opts.timeoutMs);
+  try {
+    const res = await fetch(`${base}${opts.endpointPath}`, {
+      method: "POST",
+      headers: opts.headers,
+      body: JSON.stringify(body),
+      signal: ctrl.signal,
+    });
+    if (!res.ok) throw new Error(`llm ${base} ${res.status}: ${await res.text()}`);
+    const j = (await res.json()) as any;
+    return j.choices?.[0]?.message?.content ?? '{"findings":[]}';
+  } catch (e) {
+    if ((e as Error).name === "AbortError")
+      throw new Error(`timeout after ${opts.timeoutMs}ms`);
+    throw e;
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 function kindDefaults(kind: string | undefined): {
@@ -199,9 +223,9 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-/** Retryable: empty responses, HTTP 429/5xx, transport failures. Never 4xx auth/shape errors. */
+/** Retryable: empty responses, timeouts, HTTP 429/5xx, transport failures. Never 4xx auth/shape errors. */
 export function isRetryableError(message: string): boolean {
-  return /empty (content|response)| 429[:\s]| 5\d\d[:\s]|fetch failed|timeout|ECONNRESET|ENOTFOUND|socket hang up/i.test(
+  return /empty (content|response)|timeout after| 429[:\s]| 5\d\d[:\s]|fetch failed|timeout|ECONNRESET|ENOTFOUND|socket hang up/i.test(
     message
   );
 }
@@ -227,7 +251,11 @@ export async function runAgent(opts: {
   if (!rp.apiKey) return []; // missing BYOK key -> skip silently, caller warns
 
   // Retry budget (issue #30): transient empties/5xx must not silently approve.
+  // Per-attempt timeout bounds hung gateway connections (the 9-minute run was
+  // a single fetch hanging ~5 min with no timeout).
   const maxAttempts = 1 + Math.min(Math.max(opts.provider.retries ?? 2, 0), 5);
+  const timeoutMs = (opts.provider.timeout_s ?? 110) * 1000;
+  const started = Date.now();
   let raw = "";
   let lastError = "";
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
@@ -242,6 +270,7 @@ export async function runAgent(opts: {
           system,
           user,
           extraBody: rp.extraBody,
+          timeoutMs,
         });
       } else {
         raw = await callOpenAICompatible({
@@ -254,6 +283,7 @@ export async function runAgent(opts: {
           user,
           jsonMode: rp.jsonMode,
           extraBody: rp.extraBody,
+          timeoutMs,
         });
       }
       if (raw && raw.trim()) break; // success
@@ -272,6 +302,9 @@ export async function runAgent(opts: {
       break; // non-retryable (auth/shape) — fail fast
     }
   }
+  core.info(
+    `Agent ${opts.agentName}: done in ${((Date.now() - started) / 1000).toFixed(1)}s`
+  );
   if (!raw.trim()) {
     // Total failure surfaces into the PR's agent-error block (main.ts catch).
     throw new Error(`Agent ${opts.agentName} failed after ${maxAttempts} attempt(s): ${lastError}`);

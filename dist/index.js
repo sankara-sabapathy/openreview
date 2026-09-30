@@ -44519,6 +44519,9 @@ const ProviderConfig = objectType({
     // Retry budget for transient failures (empty content, 5xx, 429, network).
     // Total failure throws into the PR's agent-error block instead of silent empty.
     retries: numberType().int().min(0).max(5).default(2),
+    // Per-attempt HTTP timeout in seconds (default 110, under Cloudflare's 120s
+    // proxy cutoff). A hung gateway connection must fail fast, not block minutes.
+    timeout_s: numberType().int().min(10).max(600).default(110),
     // Send response_format json_object (openai-chat). Disable for providers that reject it.
     json_mode: booleanType().default(true),
     // Extra JSON body fields merged into the request (provider-specific params).
@@ -44744,25 +44747,38 @@ function truncate(s, n) {
 }
 async function callAnthropic(opts) {
     const base = opts.baseUrl.replace(/\/$/, "");
-    const res = await fetch(`${base}${opts.endpointPath}`, {
-        method: "POST",
-        headers: opts.headers,
-        body: JSON.stringify({
-            model: opts.model,
-            max_tokens: 2000,
-            system: opts.system,
-            messages: [{ role: "user", content: opts.user }],
-            ...opts.extraBody,
-        }),
-    });
-    if (!res.ok)
-        throw new Error(`anthropic ${res.status}: ${await res.text()}`);
-    const j = (await res.json());
-    const text = (j.content ?? [])
-        .filter((b) => b.type === "text")
-        .map((b) => b.text)
-        .join("\n");
-    return text;
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), opts.timeoutMs);
+    try {
+        const res = await fetch(`${base}${opts.endpointPath}`, {
+            method: "POST",
+            headers: opts.headers,
+            body: JSON.stringify({
+                model: opts.model,
+                max_tokens: 2000,
+                system: opts.system,
+                messages: [{ role: "user", content: opts.user }],
+                ...opts.extraBody,
+            }),
+            signal: ctrl.signal,
+        });
+        if (!res.ok)
+            throw new Error(`anthropic ${res.status}: ${await res.text()}`);
+        const j = (await res.json());
+        const text = (j.content ?? [])
+            .filter((b) => b.type === "text")
+            .map((b) => b.text)
+            .join("\n");
+        return text;
+    }
+    catch (e) {
+        if (e.name === "AbortError")
+            throw new Error(`timeout after ${opts.timeoutMs}ms`);
+        throw e;
+    }
+    finally {
+        clearTimeout(timer);
+    }
 }
 async function callOpenAICompatible(opts) {
     const base = opts.baseUrl.replace(/\/$/, "");
@@ -44778,15 +44794,28 @@ async function callOpenAICompatible(opts) {
     };
     if (opts.jsonMode)
         body.response_format = { type: "json_object" };
-    const res = await fetch(`${base}${opts.endpointPath}`, {
-        method: "POST",
-        headers: opts.headers,
-        body: JSON.stringify(body),
-    });
-    if (!res.ok)
-        throw new Error(`llm ${base} ${res.status}: ${await res.text()}`);
-    const j = (await res.json());
-    return j.choices?.[0]?.message?.content ?? '{"findings":[]}';
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), opts.timeoutMs);
+    try {
+        const res = await fetch(`${base}${opts.endpointPath}`, {
+            method: "POST",
+            headers: opts.headers,
+            body: JSON.stringify(body),
+            signal: ctrl.signal,
+        });
+        if (!res.ok)
+            throw new Error(`llm ${base} ${res.status}: ${await res.text()}`);
+        const j = (await res.json());
+        return j.choices?.[0]?.message?.content ?? '{"findings":[]}';
+    }
+    catch (e) {
+        if (e.name === "AbortError")
+            throw new Error(`timeout after ${opts.timeoutMs}ms`);
+        throw e;
+    }
+    finally {
+        clearTimeout(timer);
+    }
 }
 function kindDefaults(kind) {
     switch (kind) {
@@ -44857,9 +44886,9 @@ function resolveProvider(provider, keys, env, sessionId) {
 function sleep(ms) {
     return new Promise((resolve) => setTimeout(resolve, ms));
 }
-/** Retryable: empty responses, HTTP 429/5xx, transport failures. Never 4xx auth/shape errors. */
+/** Retryable: empty responses, timeouts, HTTP 429/5xx, transport failures. Never 4xx auth/shape errors. */
 function isRetryableError(message) {
-    return /empty (content|response)| 429[:\s]| 5\d\d[:\s]|fetch failed|timeout|ECONNRESET|ENOTFOUND|socket hang up/i.test(message);
+    return /empty (content|response)|timeout after| 429[:\s]| 5\d\d[:\s]|fetch failed|timeout|ECONNRESET|ENOTFOUND|socket hang up/i.test(message);
 }
 async function runAgent(opts) {
     const system = SYSTEM_WRAPPER(opts.lang, opts.instructions);
@@ -44871,7 +44900,11 @@ async function runAgent(opts) {
     if (!rp.apiKey)
         return []; // missing BYOK key -> skip silently, caller warns
     // Retry budget (issue #30): transient empties/5xx must not silently approve.
+    // Per-attempt timeout bounds hung gateway connections (the 9-minute run was
+    // a single fetch hanging ~5 min with no timeout).
     const maxAttempts = 1 + Math.min(Math.max(opts.provider.retries ?? 2, 0), 5);
+    const timeoutMs = (opts.provider.timeout_s ?? 110) * 1000;
+    const started = Date.now();
     let raw = "";
     let lastError = "";
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
@@ -44886,6 +44919,7 @@ async function runAgent(opts) {
                     system,
                     user,
                     extraBody: rp.extraBody,
+                    timeoutMs,
                 });
             }
             else {
@@ -44899,6 +44933,7 @@ async function runAgent(opts) {
                     user,
                     jsonMode: rp.jsonMode,
                     extraBody: rp.extraBody,
+                    timeoutMs,
                 });
             }
             if (raw && raw.trim())
@@ -44918,6 +44953,7 @@ async function runAgent(opts) {
             break; // non-retryable (auth/shape) — fail fast
         }
     }
+    core.info(`Agent ${opts.agentName}: done in ${((Date.now() - started) / 1000).toFixed(1)}s`);
     if (!raw.trim()) {
         // Total failure surfaces into the PR's agent-error block (main.ts catch).
         throw new Error(`Agent ${opts.agentName} failed after ${maxAttempts} attempt(s): ${lastError}`);
@@ -45249,6 +45285,10 @@ function walkFiles(root, ignore, out = []) {
 }
 function readCapped(root, rel, cap) {
     const full = external_node_path_namespaceObject.resolve(root, rel);
+    // Containment: never read outside the repo (config + file list are PR-controlled).
+    const normRoot = external_node_path_namespaceObject.resolve(root) + external_node_path_namespaceObject.sep;
+    if (full !== external_node_path_namespaceObject.resolve(root) && !full.startsWith(normRoot))
+        return null;
     if (isSymlink(full))
         return null; // never read through symlinks
     try {
@@ -45282,13 +45322,12 @@ function extractDefinedNames(content, limit = 20) {
     return [...names];
 }
 function isCommentLine(line) {
+    // Conservative: only unambiguous full-line comments. Prefixes like # -- %
+    // are deliberately NOT treated as comments (C preprocessor, --count, 100%).
+    // Missing a caller for precision is worse than an extra excerpt here, so
+    // Python # comments may still match — acceptable noise.
     const t = line.trimStart();
-    return (t.startsWith("//") ||
-        t.startsWith("*") ||
-        t.startsWith("/*") ||
-        t.startsWith("#") ||
-        t.startsWith("--") ||
-        t.startsWith("%"));
+    return t.startsWith("//") || t.startsWith("/*") || t.startsWith("*");
 }
 function lineAt(content, index) {
     const lines = content.split("\n");
@@ -45344,13 +45383,27 @@ function buildContextBlock(input) {
     }
     const parts = [];
     let used = 0;
+    // Account for "\n\n" separators + "<context>\n" / "\n</context>" wrapper (21 chars
+    // total) so the final prompt never exceeds the budget.
+    const WRAPPER_OVERHEAD = 21;
     const push = (text) => {
-        if (used + text.length > budget)
+        const cost = text.length + 2; // part + separator
+        if (used + cost + WRAPPER_OVERHEAD > budget) {
+            // Truncate instead of dropping when a useful chunk would fit.
+            const room = budget - used - WRAPPER_OVERHEAD - 2 - 24;
+            if (room > 200) {
+                const cut = text.slice(0, room) + "\n...[part truncated]";
+                parts.push(cut);
+                used += cut.length + 2;
+                return true;
+            }
             return false;
+        }
         parts.push(text);
-        used += text.length;
+        used += cost;
         return true;
     };
+    const pushed = new Set(); // files actually in the prompt (differs from read set)
     let fullCount = 0;
     let extraCount = 0;
     let callerCount = 0;
@@ -45363,8 +45416,10 @@ function buildContextBlock(input) {
             if (content === null)
                 continue;
             changedContents.set(f, content);
-            if (push(`--- full file: ${f} ---\n${content}`))
+            if (push(`--- full file: ${f} ---\n${content}`)) {
                 fullCount++;
+                pushed.add(f);
+            }
             else
                 break;
         }
@@ -45388,10 +45443,12 @@ function buildContextBlock(input) {
             if (!isGlob) {
                 const direct = readCapped(input.repoRoot, pattern, 8000);
                 if (direct !== null) {
-                    if (!changedContents.has(pattern) && !matched.has(pattern)) {
+                    if (!pushed.has(pattern) && !matched.has(pattern)) {
                         matched.add(pattern);
-                        if (push(`--- context file: ${pattern} ---\n${direct}`))
+                        if (push(`--- context file: ${pattern} ---\n${direct}`)) {
                             extraCount++;
+                            pushed.add(pattern);
+                        }
                     }
                 }
                 else {
@@ -45402,13 +45459,15 @@ function buildContextBlock(input) {
             for (const f of all) {
                 if (matched.size >= 10)
                     break;
-                if (matchesAny(f, [pattern]) && !changedContents.has(f) && !matched.has(f)) {
+                if (matchesAny(f, [pattern]) && !pushed.has(f) && !matched.has(f)) {
                     const content = readCapped(input.repoRoot, f, 8000);
                     if (content === null)
                         continue;
                     matched.add(f);
-                    if (push(`--- context file: ${f} ---\n${content}`))
+                    if (push(`--- context file: ${f} ---\n${content}`)) {
                         extraCount++;
+                        pushed.add(f);
+                    }
                     else
                         break;
                 }
@@ -45418,7 +45477,7 @@ function buildContextBlock(input) {
     // 3. Call-site excerpts for defined symbols (outside their own file,
     // skipping comment-only matches).
     if (changedContents.size > 0) {
-        const candidates = all.filter((f) => !changedContents.has(f)).slice(0, 400);
+        const candidates = all.filter((f) => !pushed.has(f)).slice(0, 400);
         const fileContents = new Map();
         for (const [file, content] of changedContents) {
             for (const name of extractDefinedNames(content)) {
@@ -45430,9 +45489,8 @@ function buildContextBlock(input) {
                         fileContents.set(other, otherContent);
                     }
                     const hits = findCodeMatches(otherContent, word, 2);
-                    const idx = hits.find((h) => other !== file);
-                    if (idx !== undefined) {
-                        const excerpt = excerptAround(otherContent, idx);
+                    if (hits.length > 0) {
+                        const excerpt = excerptAround(otherContent, hits[0]);
                         if (push(`--- callers of ${name} in ${other} ---\n${excerpt}`))
                             callerCount++;
                         else

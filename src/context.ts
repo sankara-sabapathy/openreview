@@ -86,6 +86,9 @@ function walkFiles(root: string, ignore: string[], out: string[] = []): string[]
 
 function readCapped(root: string, rel: string, cap: number): string | null {
   const full = path.resolve(root, rel);
+  // Containment: never read outside the repo (config + file list are PR-controlled).
+  const normRoot = path.resolve(root) + path.sep;
+  if (full !== path.resolve(root) && !full.startsWith(normRoot)) return null;
   if (isSymlink(full)) return null; // never read through symlinks
   try {
     const content = readFileSync(full, "utf8");
@@ -119,15 +122,12 @@ export function extractDefinedNames(content: string, limit = 20): string[] {
 }
 
 function isCommentLine(line: string): boolean {
+  // Conservative: only unambiguous full-line comments. Prefixes like # -- %
+  // are deliberately NOT treated as comments (C preprocessor, --count, 100%).
+  // Missing a caller for precision is worse than an extra excerpt here, so
+  // Python # comments may still match — acceptable noise.
   const t = line.trimStart();
-  return (
-    t.startsWith("//") ||
-    t.startsWith("*") ||
-    t.startsWith("/*") ||
-    t.startsWith("#") ||
-    t.startsWith("--") ||
-    t.startsWith("%")
-  );
+  return t.startsWith("//") || t.startsWith("/*") || t.startsWith("*");
 }
 
 function lineAt(content: string, index: number): number {
@@ -184,12 +184,27 @@ export function buildContextBlock(input: ContextInput): { block: string; stats: 
   }
   const parts: string[] = [];
   let used = 0;
+  // Account for "\n\n" separators + "<context>\n" / "\n</context>" wrapper (21 chars
+  // total) so the final prompt never exceeds the budget.
+  const WRAPPER_OVERHEAD = 21;
   const push = (text: string): boolean => {
-    if (used + text.length > budget) return false;
+    const cost = text.length + 2; // part + separator
+    if (used + cost + WRAPPER_OVERHEAD > budget) {
+      // Truncate instead of dropping when a useful chunk would fit.
+      const room = budget - used - WRAPPER_OVERHEAD - 2 - 24;
+      if (room > 200) {
+        const cut = text.slice(0, room) + "\n...[part truncated]";
+        parts.push(cut);
+        used += cut.length + 2;
+        return true;
+      }
+      return false;
+    }
     parts.push(text);
-    used += text.length;
+    used += cost;
     return true;
   };
+  const pushed = new Set<string>(); // files actually in the prompt (differs from read set)
 
   let fullCount = 0;
   let extraCount = 0;
@@ -203,8 +218,10 @@ export function buildContextBlock(input: ContextInput): { block: string; stats: 
       const content = readCapped(input.repoRoot, f, 12000);
       if (content === null) continue;
       changedContents.set(f, content);
-      if (push(`--- full file: ${f} ---\n${content}`)) fullCount++;
-      else break;
+      if (push(`--- full file: ${f} ---\n${content}`)) {
+        fullCount++;
+        pushed.add(f);
+      } else break;
     }
   } else {
     for (const f of input.scopedFiles) {
@@ -226,9 +243,12 @@ export function buildContextBlock(input: ContextInput): { block: string; stats: 
       if (!isGlob) {
         const direct = readCapped(input.repoRoot, pattern, 8000);
         if (direct !== null) {
-          if (!changedContents.has(pattern) && !matched.has(pattern)) {
+          if (!pushed.has(pattern) && !matched.has(pattern)) {
             matched.add(pattern);
-            if (push(`--- context file: ${pattern} ---\n${direct}`)) extraCount++;
+            if (push(`--- context file: ${pattern} ---\n${direct}`)) {
+              extraCount++;
+              pushed.add(pattern);
+            }
           }
         } else {
           warnings.push(`context_files: '${pattern}' not found or unreadable`);
@@ -237,12 +257,14 @@ export function buildContextBlock(input: ContextInput): { block: string; stats: 
       }
       for (const f of all) {
         if (matched.size >= 10) break;
-        if (matchesAny(f, [pattern]) && !changedContents.has(f) && !matched.has(f)) {
+        if (matchesAny(f, [pattern]) && !pushed.has(f) && !matched.has(f)) {
           const content = readCapped(input.repoRoot, f, 8000);
           if (content === null) continue;
           matched.add(f);
-          if (push(`--- context file: ${f} ---\n${content}`)) extraCount++;
-          else break;
+          if (push(`--- context file: ${f} ---\n${content}`)) {
+            extraCount++;
+            pushed.add(f);
+          } else break;
         }
       }
     }
@@ -251,7 +273,7 @@ export function buildContextBlock(input: ContextInput): { block: string; stats: 
   // 3. Call-site excerpts for defined symbols (outside their own file,
   // skipping comment-only matches).
   if (changedContents.size > 0) {
-    const candidates = all.filter((f) => !changedContents.has(f)).slice(0, 400);
+    const candidates = all.filter((f) => !pushed.has(f)).slice(0, 400);
     const fileContents = new Map<string, string>();
     for (const [file, content] of changedContents) {
       for (const name of extractDefinedNames(content)) {
@@ -263,9 +285,8 @@ export function buildContextBlock(input: ContextInput): { block: string; stats: 
             fileContents.set(other, otherContent);
           }
           const hits = findCodeMatches(otherContent, word, 2);
-          const idx = hits.find((h) => other !== file);
-          if (idx !== undefined) {
-            const excerpt = excerptAround(otherContent, idx);
+          if (hits.length > 0) {
+            const excerpt = excerptAround(otherContent, hits[0]);
             if (push(`--- callers of ${name} in ${other} ---\n${excerpt}`)) callerCount++;
             else break;
           }

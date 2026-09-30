@@ -8,7 +8,7 @@
     "build": "tsc -p tsconfig.json",
     "package": "npx @vercel/ncc build dist-src/index.js -o dist --source-map --license licenses.txt",
     "typecheck": "tsc --noEmit",
-    "test": "node --test dist-src/**/*.test.js",
+    "test": "node --test dist-src/",
     "docs:validate": "node dist-src/validate.js"
   },
   "dependencies": {
