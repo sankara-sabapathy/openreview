@@ -49,10 +49,10 @@ reviews:
 
 ## File context (beyond the diff)
 
-Agents receive more than hunks: the full content of changed in-scope files, plus
-call-site excerpts for top-level symbols those files define (who imports/calls
-them elsewhere), plus any `context_files` globs — all inside a `<context>` block
-bounded by `max_context_chars`. Findings must ground in the diff; context is
+Agents receive more than hunks: the full content of changed in-scope files (each
+capped at 12KB), plus call-site excerpts for top-level symbols those files define
+(who imports/calls them elsewhere), plus any `context_files` globs — all inside a
+`<context>` block bounded by `max_context_chars` (default 20KB, `0` disables). Findings must ground in the diff; context is
 evidence only (agents are instructed never to flag context-only code).
 
 ```yaml

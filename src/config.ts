@@ -76,7 +76,7 @@ export const ReviewConfig = z.object({
   // Include full content of changed in-scope files (bounded by max_context_chars).
   include_full_files: z.boolean().optional(),
   // Per-review context budget override (defaults to defaults.max_context_chars).
-  max_context_chars: z.number().int().positive().optional(),
+  max_context_chars: z.number().int().nonnegative().optional(),
   main: AgentConfig,
   subagents: z.array(AgentConfig).default([]),
   verdict: VerdictConfig.default({}),
@@ -100,7 +100,7 @@ export const OpenReviewConfig = z.object({
       lang: z.string().default("en"),
       ignore: z.array(z.string()).default([]),
       max_diff_chars: z.number().int().positive().default(80000),
-      max_context_chars: z.number().int().positive().default(20000),
+      max_context_chars: z.number().int().nonnegative().default(20000),
       include_full_files: z.boolean().default(true),
     })
     .default({}),

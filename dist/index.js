@@ -44546,7 +44546,7 @@ const ReviewConfig = objectType({
     // Include full content of changed in-scope files (bounded by max_context_chars).
     include_full_files: booleanType().optional(),
     // Per-review context budget override (defaults to defaults.max_context_chars).
-    max_context_chars: numberType().int().positive().optional(),
+    max_context_chars: numberType().int().nonnegative().optional(),
     main: AgentConfig,
     subagents: arrayType(AgentConfig).default([]),
     verdict: VerdictConfig.default({}),
@@ -44567,7 +44567,7 @@ const OpenReviewConfig = objectType({
         lang: stringType().default("en"),
         ignore: arrayType(stringType()).default([]),
         max_diff_chars: numberType().int().positive().default(80000),
-        max_context_chars: numberType().int().positive().default(20000),
+        max_context_chars: numberType().int().nonnegative().default(20000),
         include_full_files: booleanType().default(true),
     })
         .default({}),
@@ -45196,6 +45196,14 @@ const SKIP_EXT = new Set([
     ".ttf",
     ".ico",
 ]);
+function isSymlink(full) {
+    try {
+        return (0,external_node_fs_namespaceObject.lstatSync)(full).isSymbolicLink();
+    }
+    catch {
+        return true; // unreadable -> treat as unusable
+    }
+}
 function walkFiles(root, ignore, out = []) {
     let entries;
     try {
@@ -45206,6 +45214,8 @@ function walkFiles(root, ignore, out = []) {
     }
     for (const e of entries) {
         const full = external_node_path_namespaceObject.join(root, e);
+        if (isSymlink(full))
+            continue; // never follow symlinks (exfiltration risk)
         let st;
         try {
             st = (0,external_node_fs_namespaceObject.statSync)(full);
@@ -45219,7 +45229,8 @@ function walkFiles(root, ignore, out = []) {
             walkFiles(full, ignore, out);
         }
         else {
-            const rel = external_node_path_namespaceObject.relative(process.cwd(), full).replace(/\\/g, "/");
+            // Paths are repo-relative from the walk root (not process.cwd()).
+            const rel = external_node_path_namespaceObject.relative(root, full).replace(/\\/g, "/");
             if (SKIP_EXT.has(external_node_path_namespaceObject.extname(e)))
                 continue;
             if (ignore.length > 0 && matchesAny(rel, ignore))
@@ -45236,9 +45247,12 @@ function walkFiles(root, ignore, out = []) {
     }
     return out;
 }
-function readCapped(file, cap) {
+function readCapped(root, rel, cap) {
+    const full = external_node_path_namespaceObject.resolve(root, rel);
+    if (isSymlink(full))
+        return null; // never read through symlinks
     try {
-        const content = (0,external_node_fs_namespaceObject.readFileSync)(file, "utf8");
+        const content = (0,external_node_fs_namespaceObject.readFileSync)(full, "utf8");
         return content.length > cap ? content.slice(0, cap) + "\n...[file truncated]" : content;
     }
     catch {
@@ -45267,6 +45281,40 @@ function extractDefinedNames(content, limit = 20) {
     }
     return [...names];
 }
+function isCommentLine(line) {
+    const t = line.trimStart();
+    return (t.startsWith("//") ||
+        t.startsWith("*") ||
+        t.startsWith("/*") ||
+        t.startsWith("#") ||
+        t.startsWith("--") ||
+        t.startsWith("%"));
+}
+function lineAt(content, index) {
+    const lines = content.split("\n");
+    let count = 0;
+    for (let i = 0; i < lines.length; i++) {
+        count += lines[i].length + 1;
+        if (count > index)
+            return i;
+    }
+    return -1;
+}
+/** Find up to `tries` code (non-comment) matches of word, returning char indices. */
+function findCodeMatches(content, word, tries = 6) {
+    const out = [];
+    const g = new RegExp(word.source, "g");
+    let m;
+    let guard = 0;
+    while ((m = g.exec(content)) !== null && out.length < tries && guard++ < 200) {
+        const line = lineAt(content, m.index);
+        if (line >= 0 && !isCommentLine(content.split("\n")[line]))
+            out.push(m.index);
+        if (m.index === g.lastIndex)
+            g.lastIndex++; // avoid zero-width stall
+    }
+    return out;
+}
 function excerptAround(content, index, radius = 5) {
     const lines = content.split("\n");
     let count = 0;
@@ -45288,9 +45336,14 @@ function excerptAround(content, index, radius = 5) {
  * excerpts for top-level symbols defined in changed files. Bounded by budget.
  */
 function buildContextBlock(input) {
+    const budget = input.maxContextChars;
+    if (budget <= 0) {
+        const stats = "context: disabled (max_context_chars <= 0)";
+        core.info(stats);
+        return { block: "", stats };
+    }
     const parts = [];
     let used = 0;
-    const budget = input.maxContextChars;
     const push = (text) => {
         if (used + text.length > budget)
             return false;
@@ -45301,11 +45354,12 @@ function buildContextBlock(input) {
     let fullCount = 0;
     let extraCount = 0;
     let callerCount = 0;
+    const warnings = [];
     // 1. Full content of changed in-scope files.
     const changedContents = new Map();
     if (input.includeFullFiles) {
         for (const f of input.scopedFiles) {
-            const content = readCapped(f, 12000);
+            const content = readCapped(input.repoRoot, f, 12000);
             if (content === null)
                 continue;
             changedContents.set(f, content);
@@ -45317,28 +45371,53 @@ function buildContextBlock(input) {
     }
     else {
         for (const f of input.scopedFiles) {
-            const content = readCapped(f, 12000);
+            const content = readCapped(input.repoRoot, f, 12000);
             if (content !== null)
                 changedContents.set(f, content);
         }
     }
-    // 2. Extra context_files globs.
+    // Single repo walk reused by extras + callers (was up to 3 walks before).
+    const needWalk = input.contextFiles.length > 0 || changedContents.size > 0;
+    const all = needWalk ? walkFiles(input.repoRoot, input.ignore) : [];
+    // 2. Extra context_files: explicit paths read directly (never silently dropped
+    // by walk filters); globs resolved through the walk.
     if (input.contextFiles.length > 0) {
-        const all = walkFiles(input.repoRoot, input.ignore);
-        const matched = all.filter((f) => matchesAny(f, input.contextFiles) && !changedContents.has(f));
-        for (const f of matched.slice(0, 10)) {
-            const content = readCapped(f, 8000);
-            if (content === null)
+        const matched = new Set();
+        for (const pattern of input.contextFiles) {
+            const isGlob = /[*?[\]{}!]/.test(pattern);
+            if (!isGlob) {
+                const direct = readCapped(input.repoRoot, pattern, 8000);
+                if (direct !== null) {
+                    if (!changedContents.has(pattern) && !matched.has(pattern)) {
+                        matched.add(pattern);
+                        if (push(`--- context file: ${pattern} ---\n${direct}`))
+                            extraCount++;
+                    }
+                }
+                else {
+                    warnings.push(`context_files: '${pattern}' not found or unreadable`);
+                }
                 continue;
-            if (push(`--- context file: ${f} ---\n${content}`))
-                extraCount++;
-            else
-                break;
+            }
+            for (const f of all) {
+                if (matched.size >= 10)
+                    break;
+                if (matchesAny(f, [pattern]) && !changedContents.has(f) && !matched.has(f)) {
+                    const content = readCapped(input.repoRoot, f, 8000);
+                    if (content === null)
+                        continue;
+                    matched.add(f);
+                    if (push(`--- context file: ${f} ---\n${content}`))
+                        extraCount++;
+                    else
+                        break;
+                }
+            }
         }
     }
-    // 3. Call-site excerpts for defined symbols (outside their own file).
+    // 3. Call-site excerpts for defined symbols (outside their own file,
+    // skipping comment-only matches).
     if (changedContents.size > 0) {
-        const all = walkFiles(input.repoRoot, input.ignore);
         const candidates = all.filter((f) => !changedContents.has(f)).slice(0, 400);
         const fileContents = new Map();
         for (const [file, content] of changedContents) {
@@ -45347,11 +45426,12 @@ function buildContextBlock(input) {
                 for (const other of candidates) {
                     let otherContent = fileContents.get(other);
                     if (otherContent === undefined) {
-                        otherContent = readCapped(other, 60000) ?? "";
+                        otherContent = readCapped(input.repoRoot, other, 60000) ?? "";
                         fileContents.set(other, otherContent);
                     }
-                    const idx = otherContent.search(word);
-                    if (idx >= 0 && other !== file) {
+                    const hits = findCodeMatches(otherContent, word, 2);
+                    const idx = hits.find((h) => other !== file);
+                    if (idx !== undefined) {
                         const excerpt = excerptAround(otherContent, idx);
                         if (push(`--- callers of ${name} in ${other} ---\n${excerpt}`))
                             callerCount++;
@@ -45368,7 +45448,12 @@ function buildContextBlock(input) {
                 break;
         }
     }
-    const stats = `context: ${fullCount} full files, ${extraCount} extra files, ${callerCount} caller excerpts, ${used}/${budget} chars`;
+    let stats = `context: ${fullCount} full files, ${extraCount} extra files, ${callerCount} caller excerpts, ${used}/${budget} chars`;
+    if (warnings.length > 0) {
+        stats += `; warnings: ${warnings.join("; ")}`;
+        for (const w of warnings)
+            core.warning(`context: ${w}`);
+    }
     core.info(stats);
     if (parts.length === 0)
         return { block: "", stats };
