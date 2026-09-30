@@ -1,0 +1,20 @@
+# Built-in template: openreview/performance — perf-focused pass.
+# Usage: extends: [openreview/performance@0.7.0]
+# You MUST define providers.default in your own file.
+version: 1
+reviews:
+  - id: performance
+    if_paths: ["**"]
+    strategy: any
+    main:
+      provider: default
+      instructions: "Performance reviewer. Synthesize findings; only report issues with concrete cost (N+1, hot loops, payload size, bundle impact)."
+    subagents:
+      - name: hotspots
+        provider: default
+        instructions: "N+1 queries, O(n^2) loops, unbounded allocations, missing pagination, large dependencies."
+    verdict:
+      mode: comment
+      min_severity: medium
+      post_inline: true
+      deduplicate: true

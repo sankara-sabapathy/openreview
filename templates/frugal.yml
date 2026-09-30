@@ -1,0 +1,18 @@
+# Built-in template: openreview/frugal — cheapest possible review: one agent, one call.
+# Usage: extends: [openreview/frugal@0.7.0]
+# You MUST define providers.default in your own file (pick your cheapest model).
+version: 1
+defaults:
+  max_diff_chars: 40000
+reviews:
+  - id: quick-pass
+    if_paths: ["**"]
+    strategy: any
+    main:
+      provider: default
+      instructions: "Cheap first pass. Report only high-confidence bugs and security issues. Max 5 findings. Skip style entirely."
+    verdict:
+      mode: comment
+      min_severity: high
+      post_inline: false
+      deduplicate: true

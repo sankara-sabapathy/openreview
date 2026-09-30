@@ -4,6 +4,7 @@ import { readFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import * as YAML from "yaml";
 import { parseConfig } from "./config.js";
+import { templateContextFor, resolveExtends, mergeConfigs, parseConfigLoose } from "./templates.js";
 import { resolveKeysFromEnv, runAgent, type Finding } from "./providers.js";
 import {
   matchesAny, filterIgnored, dedupeFindings,
@@ -24,7 +25,22 @@ async function loadConfig(configPath: string) {
   for (const p of candidates) {
     if (!existsSync(p)) continue;
     const raw = YAML.parse(await readFile(p, "utf8"));
-    return { config: parseConfig(raw), path: p };
+    const loose = parseConfigLoose(raw);
+    const extendsEntries = (loose.extends as string[] | undefined) ?? [];
+    if (extendsEntries.length === 0) {
+      return { config: parseConfig(raw), path: p };
+    }
+    // Templates resolve in order; this file overlays on top (child wins).
+    const ctx = templateContextFor(p, process.env as any);
+    const { merged, sources } = await resolveExtends(extendsEntries, ctx);
+    const { extends: _ignored, ...top } = loose;
+    const config = parseConfig(mergeConfigs(merged, top) as unknown);
+    core.info(
+      `Resolved ${sources.length} template(s): ${sources
+        .map((s) => (s.sha ? `${s.source} @${s.sha.slice(0, 7)}` : s.source))
+        .join(", ")}`
+    );
+    return { config, path: p };
   }
   throw new Error(
     `No config found. Tried: ${candidates.join(", ")}. Add .github/openreview.yml (see openreview.example.yml).`

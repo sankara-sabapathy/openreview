@@ -1,0 +1,28 @@
+# Built-in template: openreview/security — strict review for sensitive paths.
+# Usage: extends: [openreview/security@0.7.0]
+# Pairs well with general (different review ids merge side by side).
+# You MUST define providers.default in your own file.
+version: 1
+# providers:
+#   default:
+#     protocol: openai-chat
+#     model: kimi-k2.7-code
+#     base_url: https://opencode.ai/zen/go/v1
+#     key_from: secrets.OPENCODE_API_KEY
+#     extra_body: { temperature: 1 }
+reviews:
+  - id: security-strict
+    if_paths: ["auth/**", "api/**", "payments/**", "src/**/auth*", "**/login*", "**/session*"]
+    strategy: any
+    main:
+      provider: default
+      instructions: "Staff security reviewer. OWASP top 10, authz, injection, secrets, crypto misuse. Only high-confidence findings."
+    subagents:
+      - name: secrets-scan
+        provider: default
+        instructions: "Find leaked secrets, hardcoded credentials, overly broad permissions, weak crypto."
+    verdict:
+      mode: request_changes
+      min_severity: high
+      post_inline: true
+      deduplicate: true

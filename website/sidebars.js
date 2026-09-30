@@ -5,6 +5,7 @@ const sidebars = {
       "intro",
       "quickstart",
       "configuration",
+      "templates",
       {
         type: "category",
         label: "Providers",

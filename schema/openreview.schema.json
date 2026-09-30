@@ -10,6 +10,11 @@
       "type": "string",
       "description": "Optional minimum action release, e.g. '>=0.3.0'. The workflow ref selects the release; this only fails fast."
     },
+    "extends": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Template inheritance: openreview/<name>@<version>, github:<owner>/<repo>[/path]@sha:<hex> (immutable pin required), ./local.yml. Resolved in order, this file overlays on top."
+    },
     "defaults": {
       "type": "object",
       "properties": {

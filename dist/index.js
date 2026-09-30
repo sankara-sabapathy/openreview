@@ -44544,10 +44544,13 @@ const ReviewConfig = objectType({
 });
 const OpenReviewConfig = objectType({
     version: literalType(1),
-    // Optional floor for the running action, e.g. ">=0.3.0". The workflow ref
-    // (uses: ...@v1) selects the release; this only fails fast with a clear
-    // message when the runner is older than the config needs.
+    // Optional floor for the running action (see above) + template inheritance.
+    // extends entries resolve in order, then this file overlays on top:
+    // - "openreview/<name>@<version>" — built-in drop-in from templates/ (version informational)
+    // - "github:<owner>/<repo>[/<path>][@sha:<hex>|@<40-hex>]" — community template (immutable pin REQUIRED)
+    // - "./relative.yml" — local file next to this config
     requires_action: stringType().optional(),
+    extends: arrayType(stringType()).default([]),
     defaults: objectType({
         on: arrayType(stringType()).default(["opened", "synchronize", "ready_for_review"]),
         command: stringType().default("/review"),
@@ -44568,6 +44571,147 @@ const OpenReviewConfig = objectType({
 });
 function parseConfig(raw) {
     return OpenReviewConfig.parse(raw);
+}
+
+;// CONCATENATED MODULE: external "node:path"
+const external_node_path_namespaceObject = __WEBPACK_EXTERNAL_createRequire(import.meta.url)("node:path");
+;// CONCATENATED MODULE: ./dist-src/templates.js
+
+
+
+
+
+
+function templateContextFor(configPath, env) {
+    const fromAction = env["GITHUB_ACTION_PATH"];
+    // Fallback when GITHUB_ACTION_PATH is unset (local validate): the entry file is
+    // always dist/index.js or dist-src/<entry>.js, so repo root is one level up.
+    // (Deliberately argv-based, not import.meta: keeps the ncc bundle single-file.)
+    const fromEntry = process.argv[1]
+        ? external_node_path_namespaceObject.resolve(external_node_path_namespaceObject.dirname(process.argv[1]), "..")
+        : process.cwd();
+    return {
+        actionDir: fromAction || fromEntry,
+        configDir: external_node_path_namespaceObject.dirname(external_node_path_namespaceObject.resolve(configPath)),
+        env,
+    };
+}
+function parsePartial(raw) {
+    // Templates are full-shaped configs; validate loosely here, strictly after merge.
+    return OpenReviewConfig.deepPartial().parse(raw);
+}
+function parseConfigLoose(raw) {
+    return parsePartial(raw);
+}
+async function loadYamlFile(file) {
+    return dist/* parse */.qg(await (0,promises_namespaceObject.readFile)(file, "utf8"));
+}
+function builtinPath(ctx, name) {
+    if (!/^[a-z0-9-]+$/.test(name))
+        return null;
+    for (const ext of ["yml", "yaml"]) {
+        const p = external_node_path_namespaceObject.join(ctx.actionDir, "templates", `${name}.${ext}`);
+        if ((0,external_node_fs_namespaceObject.existsSync)(p))
+            return p;
+    }
+    return null;
+}
+function localPath(ctx, ref) {
+    const rel = ref.replace(/^file:/, "");
+    return external_node_path_namespaceObject.resolve(ctx.configDir, rel);
+}
+const GITHUB_REF = /^github:([^/\s]+)\/([^/\s@]+)(?:\/([^@\s]+))?@(.+)$/;
+async function fetchRemote(owner, repo, filePath, sha, ctx) {
+    const url = `https://raw.githubusercontent.com/${owner}/${repo}/${sha}/${filePath}`;
+    const headers = {
+        "user-agent": "OpenReview/1.0 (github-action)",
+        accept: "text/plain",
+    };
+    const token = ctx.env["INPUT_GITHUB-TOKEN"] || ctx.env["GITHUB_TOKEN"] || ctx.env["GH_TOKEN"];
+    if (token)
+        headers["authorization"] = `Bearer ${token}`;
+    const res = await fetch(url, { headers });
+    if (!res.ok)
+        throw new Error(`template fetch failed ${res.status} for ${owner}/${repo}@${sha.slice(0, 7)}/${filePath}`);
+    return dist/* parse */.qg(await res.text());
+}
+/** Resolve one extends entry to a partial config (no recursion here; caller loops). */
+async function resolveOne(entry, ctx) {
+    // Built-in: openreview/<name>[@<version>] (version informational; ships with the action)
+    const builtin = /^openreview[/:]([^@\s]+)(?:@(\S+))?$/.exec(entry);
+    if (builtin) {
+        const file = builtinPath(ctx, builtin[1]);
+        if (!file)
+            throw new Error(`unknown built-in template '${builtin[1]}' (see templates/ + docs)`);
+        core.info(`Template ${entry}: built-in ${file}`);
+        return { source: entry, sha: null, config: parsePartial(await loadYamlFile(file)) };
+    }
+    // Remote: github:owner/repo[/path]@sha:<hex>|@<40-hex> (immutable pin REQUIRED)
+    const gh = GITHUB_REF.exec(entry);
+    if (gh) {
+        const [, owner, repo, p, ref] = gh;
+        const sha = ref.replace(/^sha:/, "");
+        if (!/^[0-9a-f]{40}$/i.test(sha)) {
+            throw new Error(`template '${entry}': remote refs must pin an immutable commit SHA (@sha:<40-hex>). Branch tags auto-update and would silently change your reviews.`);
+        }
+        const filePath = p || "openreview-template.yml";
+        core.info(`Template ${entry}: remote ${owner}/${repo}@${sha.slice(0, 7)}/${filePath}`);
+        return { source: entry, sha, config: parsePartial(await fetchRemote(owner, repo, filePath, sha, ctx)) };
+    }
+    // Local file: ./x.yml, ../x.yml, /abs/x.yml, file:x.yml
+    if (/^(\.|file:|\/)/.test(entry)) {
+        const file = localPath(ctx, entry);
+        if (!(0,external_node_fs_namespaceObject.existsSync)(file))
+            throw new Error(`template file not found: ${file} (from '${entry}')`);
+        core.info(`Template ${entry}: local ${file}`);
+        return { source: entry, sha: null, config: parsePartial(await loadYamlFile(file)) };
+    }
+    throw new Error(`template '${entry}': unknown form. Use openreview:<name>[@v], github:<owner>/<repo>[/path]@sha:<hex>, or ./local.yml`);
+}
+/** Merge overlay onto base. Child wins; reviews merge by id; arrays replace. */
+function mergeConfigs(base, over) {
+    const mergedReviews = [...(base.reviews ?? [])];
+    for (const r of over.reviews ?? []) {
+        const i = mergedReviews.findIndex((x) => x.id === r.id);
+        if (i >= 0)
+            mergedReviews[i] = r;
+        else
+            mergedReviews.push(r);
+    }
+    return {
+        version: over.version ?? base.version,
+        requires_action: over.requires_action ?? base.requires_action,
+        defaults: { ...(base.defaults ?? {}), ...(over.defaults ?? {}) },
+        providers: { ...(base.providers ?? {}), ...(over.providers ?? {}) },
+        reviews: mergedReviews.length > 0 ? mergedReviews : base.reviews ?? over.reviews,
+        global_verdict: { ...(base.global_verdict ?? {}), ...(over.global_verdict ?? {}) },
+    };
+}
+const MAX_DEPTH = 5;
+/**
+ * Resolve an extends chain (in order) into one merged partial config.
+ * Templates may nest (depth ≤ 5); cycles and repeat visits are rejected.
+ */
+async function resolveExtends(entries, ctx, seen = [], depth = 0) {
+    if (depth > MAX_DEPTH)
+        throw new Error("template extends nesting too deep (max 5)");
+    let merged = {};
+    const sources = [];
+    for (const entry of entries) {
+        if (seen.includes(entry))
+            throw new Error(`template extends cycle detected at '${entry}'`);
+        const resolved = await resolveOne(entry, ctx);
+        sources.push(resolved);
+        const nested = resolved.config.extends;
+        if (nested && nested.length > 0) {
+            const inner = await resolveExtends(nested, ctx, [...seen, entry], depth + 1);
+            sources.push(...inner.sources);
+            merged = mergeConfigs(merged, inner.merged);
+        }
+        const { extends: _ignored, ...rest } = resolved.config;
+        merged = mergeConfigs(merged, rest);
+    }
+    return { merged, sources };
 }
 
 ;// CONCATENATED MODULE: ./dist-src/providers.js
@@ -44983,6 +45127,7 @@ async function createInlineReview(octokit, owner, repo, pullNumber, commitSha, v
 
 
 
+
 const CONFIG_CANDIDATES = [
     ".github/openreview.yml",
     ".github/openreview.yaml",
@@ -44995,7 +45140,20 @@ async function loadConfig(configPath) {
         if (!(0,external_node_fs_namespaceObject.existsSync)(p))
             continue;
         const raw = dist/* parse */.qg(await (0,promises_namespaceObject.readFile)(p, "utf8"));
-        return { config: parseConfig(raw), path: p };
+        const loose = parseConfigLoose(raw);
+        const extendsEntries = loose.extends ?? [];
+        if (extendsEntries.length === 0) {
+            return { config: parseConfig(raw), path: p };
+        }
+        // Templates resolve in order; this file overlays on top (child wins).
+        const ctx = templateContextFor(p, process.env);
+        const { merged, sources } = await resolveExtends(extendsEntries, ctx);
+        const { extends: _ignored, ...top } = loose;
+        const config = parseConfig(mergeConfigs(merged, top));
+        core.info(`Resolved ${sources.length} template(s): ${sources
+            .map((s) => (s.sha ? `${s.source} @${s.sha.slice(0, 7)}` : s.source))
+            .join(", ")}`);
+        return { config, path: p };
     }
     throw new Error(`No config found. Tried: ${candidates.join(", ")}. Add .github/openreview.yml (see openreview.example.yml).`);
 }

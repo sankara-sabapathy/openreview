@@ -50,7 +50,8 @@ global_verdict: # merges per-review verdicts
   fail_check_on_request_changes: false # fail CI when verdict is request_changes?
 ```
 
-Top-level keys: `version`, `requires_action` (optional release floor, e.g.
+Top-level keys: `version`, `extends` (optional template inheritance — see
+[Templates](./templates)), `requires_action` (optional release floor, e.g.
 `">=0.3.0"` — the workflow `uses:` ref selects the release, the yaml only guards
 it), `defaults`, `providers{}`, `reviews[]`, `global_verdict`.
 

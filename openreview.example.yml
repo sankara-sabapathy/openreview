@@ -3,6 +3,12 @@ version: 1
 # The workflow ref (uses: ...@v1) selects the release; this is only a floor check.
 # requires_action: ">=0.3.0"
 
+# Inherit shared config instead of writing everything (see website/docs/templates).
+# Templates resolve in order; this file overlays on top (child wins).
+# extends:
+#   - openreview/general@0.7.0
+#   - openreview/security@0.7.0
+
 defaults:
   on: [opened, synchronize, ready_for_review]
   command: "/review"

@@ -18,6 +18,10 @@ jobs:
       - run: npm run typecheck
       - run: npm run build
       - run: npm run package
+      - name: Check dist/ has no stray chunks (ncc must emit a single index.js)
+        run: |
+          extra=$(ls dist/*.js | grep -v 'dist/index.js' || true)
+          if [ -n "$extra" ]; then echo "::error::stray bundle chunks: $extra. Remove them; dist/ must be single-file."; exit 1; fi
       - name: Check dist/ is committed and fresh
         run: git diff --exit-code -- dist/ || (echo "::error::dist/ is stale. Run npm run build && npm run package and commit." && exit 1)
       - run: node dist-src/validate.js openreview.example.yml

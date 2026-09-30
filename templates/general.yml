@@ -1,0 +1,33 @@
+# Built-in template: openreview/general — balanced default review.
+# Usage: extends: [openreview/general@0.7.0]
+# You MUST define providers.default in your own file (see commented example).
+version: 1
+defaults:
+  ignore: ["**.lock", "dist/**"]
+  max_diff_chars: 80000
+# providers:
+#   default:
+#     protocol: openai-chat
+#     model: glm-5.3-flash
+#     base_url: https://opencode.ai/zen/go/v1
+#     key_from: secrets.OPENCODE_API_KEY
+reviews:
+  - id: general-quality
+    if_paths: ["**"]
+    strategy: any
+    main:
+      provider: default
+      instructions: "Synthesize sub-agent findings. Strict on bugs, lenient on style. Deduplicate."
+    subagents:
+      - name: correctness
+        provider: default
+        instructions: "Bugs, race conditions, null handling, missing tests."
+    verdict:
+      mode: comment
+      min_severity: medium
+      post_inline: true
+      deduplicate: true
+global_verdict:
+  strategy: any_blocking
+  sticky_comment: true
+  fail_check_on_request_changes: false

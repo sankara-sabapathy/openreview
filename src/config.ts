@@ -76,10 +76,13 @@ export type ReviewConfig = z.infer<typeof ReviewConfig>;
 
 export const OpenReviewConfig = z.object({
   version: z.literal(1),
-  // Optional floor for the running action, e.g. ">=0.3.0". The workflow ref
-  // (uses: ...@v1) selects the release; this only fails fast with a clear
-  // message when the runner is older than the config needs.
+  // Optional floor for the running action (see above) + template inheritance.
+  // extends entries resolve in order, then this file overlays on top:
+  // - "openreview/<name>@<version>" — built-in drop-in from templates/ (version informational)
+  // - "github:<owner>/<repo>[/<path>][@sha:<hex>|@<40-hex>]" — community template (immutable pin REQUIRED)
+  // - "./relative.yml" — local file next to this config
   requires_action: z.string().optional(),
+  extends: z.array(z.string()).default([]),
   defaults: z
     .object({
       on: z.array(z.string()).default(["opened", "synchronize", "ready_for_review"]),
