@@ -12,6 +12,7 @@ import {
   satisfiesActionVersion, runningActionVersion,
 } from "./reviewer.js";
 import { renderStickyBody, upsertStickyComment, createInlineReview } from "./github.js";
+import { buildContextBlock } from "./context.js";
 
 const CONFIG_CANDIDATES = [
   ".github/openreview.yml",
@@ -109,6 +110,17 @@ export async function run(): Promise<void> {
       }
       // Build a scoped diff (best-effort: filter diff hunks by filename header)
       const scopedDiff = scopedFiles.length === inScope.length ? diff : diff; // keep full diff; agents see file names
+      // Cross-file context (issue #20): full files + call-site excerpts, budgeted.
+      const { block: contextBlock } = buildContextBlock({
+        repoRoot: process.cwd(),
+        scopedFiles,
+        contextFiles: review.context_files,
+        includeFullFiles:
+          review.include_full_files ?? config.defaults.include_full_files ?? true,
+        maxContextChars:
+          review.max_context_chars ?? config.defaults.max_context_chars ?? 20000,
+        ignore: config.defaults.ignore ?? [],
+      });
       const tasks: Promise<{ findings: Finding[]; error?: string; agent: string }>[] = [];
       const agentDefs = [
         { ...review.main, name: review.main.name ?? `${review.id}:main` },
@@ -131,6 +143,7 @@ export async function run(): Promise<void> {
             keys,
             maxDiffChars: config.defaults.max_diff_chars ?? 80000,
             sessionId,
+            contextBlock,
           })
             .then((findings) => ({ findings, agent: a.name ?? "agent" }))
             .catch((e) => {

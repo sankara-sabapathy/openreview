@@ -78,6 +78,11 @@ reviews:
   - id: general-quality
     if_paths: ["**"]
     strategy: majority
+    # Cross-file context (see website/docs/configuration): full changed files +
+    # call-site excerpts are automatic (bounded by max_context_chars); add more:
+    # context_files: ["src/types.ts", "db/schema.sql"]
+    # include_full_files: true
+    # max_context_chars: 20000
     main:
       provider: claude
       instructions: "Synthesize sub-agent findings. Strict on bugs and correctness, lenient on style. Deduplicate."

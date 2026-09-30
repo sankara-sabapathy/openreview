@@ -78,6 +78,11 @@ reviews:
   - id: general-quality
     if_paths: ["**"]
     strategy: any # any | all | majority: per-provider ballots; see website/docs/multi-review
+    # Cross-file context: full changed files + call-site excerpts automatic
+    # (bounded by max_context_chars below); add explicit files when needed:
+    # context_files: ["src/config.ts"]
+    # include_full_files: true
+    # max_context_chars: 20000
     main:
       # name: defaults to "<review-id>:main"
       provider: opencode

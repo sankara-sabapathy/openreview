@@ -15,6 +15,8 @@ defaults:
   lang: en
   ignore: ["**.lock", "dist/**"] # path globs skipped everywhere
   max_diff_chars: 80000          # diff truncation budget per agent
+  max_context_chars: 20000       # cross-file context budget per review (0 = diff only)
+  include_full_files: true       # include full changed files as context by default
 
 providers:
   go: # any name; referenced by agents below
@@ -44,6 +46,22 @@ reviews:
       min_severity: medium # suggestion | medium | high
       post_inline: true
       deduplicate: true
+
+## File context (beyond the diff)
+
+Agents receive more than hunks: the full content of changed in-scope files, plus
+call-site excerpts for top-level symbols those files define (who imports/calls
+them elsewhere), plus any `context_files` globs — all inside a `<context>` block
+bounded by `max_context_chars`. Findings must ground in the diff; context is
+evidence only (agents are instructed never to flag context-only code).
+
+```yaml
+reviews:
+  - id: general-quality
+    context_files: ["src/types.ts", "db/schema.sql"] # always include these
+    include_full_files: true   # or false for diff-only reviews
+    max_context_chars: 20000   # per-review budget override
+```
 
 global_verdict: # merges per-review verdicts
   strategy: any_blocking # any_blocking | max_severity | majority

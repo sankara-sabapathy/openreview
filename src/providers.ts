@@ -216,9 +216,13 @@ export async function runAgent(opts: {
   keys: ResolvedKeys;
   maxDiffChars: number;
   sessionId: string;
+  contextBlock?: string;
 }): Promise<Finding[]> {
   const system = SYSTEM_WRAPPER(opts.lang, opts.instructions);
-  const user = `Review this unified diff (truncated):\n\n${truncate(opts.diff, opts.maxDiffChars)}`;
+  let user = `Review this unified diff (truncated):\n\n${truncate(opts.diff, opts.maxDiffChars)}`;
+  if (opts.contextBlock) {
+    user += `\n\n${opts.contextBlock}\nGround every finding in the diff above; use <context> only as cross-file evidence (callers, types, contracts). Never flag context-only code.`;
+  }
   const rp = resolveProvider(opts.provider, opts.keys, process.env as any, opts.sessionId);
   if (!rp.apiKey) return []; // missing BYOK key -> skip silently, caller warns
 
