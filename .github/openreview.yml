@@ -1,27 +1,111 @@
-# TEMPORARY (feature-branch live proof for #19): this repo's reviews expressed
-# via extends. Reverted to the explicit showcase before merge (AGENTS.md rule).
+# OpenReview reference config — this file is the live showcase for anyone using
+# OpenReview. Rule (see AGENTS.md): it must demonstrate every available field and
+# stay in sync with src/config.ts. Fields not needed for this repo's own reviews
+# are shown commented out. Validate with: node dist-src/validate.js .github/openreview.yml
 version: 1
+
+# Optional floor for the running action release. The workflow `uses:` ref selects
+# the release; this only fails fast when the runner is older than the config needs.
 requires_action: ">=0.3.0"
-extends:
-  - openreview/general@0.7.0
+
+# Template inheritance (see website/docs/templates). This repo stays fully
+# explicit as the canonical showcase, but any consumer can replace the whole
+# file below with:
+# extends: [openreview/general@0.7.0, openreview/security@0.7.0]
+# plus their own providers: block. Remote community templates pin a commit SHA:
+# extends: [github:acme-corp/review-standards/backend@sha:abc123...]
+
+defaults:
+  on: [opened, synchronize, ready_for_review]
+  command: "/review"
+  draft: false
+  lang: en
+  ignore: ["**.lock", "dist/**", "website/build/**"]
+  max_diff_chars: 80000
+
 providers:
+  # --- Active: OpenCode Go subscription (this repo's own reviews) ---
   opencode:
+    # kind: is a deprecated shorthand (anthropic|openai|opencode|openai-compatible).
+    # Prefer protocol below; both are shown here for reference.
     kind: opencode
-    protocol: openai-chat
+    protocol: openai-chat # openai-chat | anthropic-messages
     model: glm-5.3-flash
     base_url: https://opencode.ai/zen/go/v1
-    key_from: secrets.OPENCODE_API_KEY
+    key_from: secrets.OPENCODE_API_KEY # any $NAME: "secrets.FOO" | "env.FOO"
+    # auth: { header: Authorization, scheme: Bearer } # defaults shown; Azure uses { header: api-key, scheme: "" }
+    # headers: { X-Custom: value } # extra headers merged into every request
+    # endpoint_path: /chat/completions # default per protocol (/chat/completions, /v1/messages)
+    # json_mode: true # set false for providers rejecting response_format
+    # extra_body: { temperature: 0.1 } # extra JSON body fields merged into requests
+
+  # --- Commented examples: any provider works with protocol + base_url + key_from + model ---
+  # Claude subscription (Pro/Max/…): `claude setup-token` → secret → step env.
+  # The explicit auth block forces Bearer (without it, x-api-key is assumed).
+  # claude-subscription:
+  #   protocol: anthropic-messages
+  #   model: claude-sonnet-5
+  #   key_from: secrets.CLAUDE_CODE_OAUTH_TOKEN
+  #   auth: { header: Authorization, scheme: Bearer }
+  #   headers: { anthropic-beta: oauth-2025-04-20 }
+  # claude:
+  #   protocol: anthropic-messages
+  #   model: claude-sonnet-5
+  #   key_from: secrets.ANTHROPIC_API_KEY
+  # codex:
+  #   protocol: openai-chat
+  #   model: gpt-5.3-codex
+  #   base_url: https://api.openai.com/v1
+  #   key_from: secrets.OPENAI_API_KEY
+  # groq:
+  #   protocol: openai-chat
+  #   model: llama-3.3-70b-versatile
+  #   base_url: https://api.groq.com/openai/v1
+  #   key_from: secrets.GROQ_API_KEY
+  #   json_mode: false
+  # azure:
+  #   protocol: openai-chat
+  #   model: my-deployment
+  #   base_url: https://RESOURCE.openai.azure.com/openai/deployments/my-deployment
+  #   key_from: secrets.AZURE_OPENAI_KEY
+  #   auth: { header: api-key, scheme: "" }
+
 reviews:
+  # --- Active review: everything in this repo gets the general pass ---
   - id: general-quality
+    if_paths: ["**"]
+    strategy: any # any | all | majority: per-provider ballots; see website/docs/multi-review
     main:
+      # name: defaults to "<review-id>:main"
       provider: opencode
       instructions: "Synthesize findings. Strict on bugs, lenient on style."
+      # max_files: 50 # reserved; currently unused
     subagents:
       - name: correctness
         provider: opencode
         instructions: "Bugs, races, missing tests."
     verdict:
-      mode: comment
-      min_severity: medium
+      mode: comment # comment | approve | request_changes
+      min_severity: medium # suggestion | medium | high
       post_inline: true
       deduplicate: true
+
+  # --- Commented example: scoped strict review with a blocking verdict ---
+  # - id: security-strict
+  #   if_paths: ["auth/**", "api/**", "payments/**", "src/**"]
+  #   main:
+  #     provider: codex
+  #     instructions: "Staff security reviewer. OWASP, authz, injection, secrets. High-confidence findings only."
+  #   subagents:
+  #     - name: secrets-scan
+  #       provider: opencode
+  #       instructions: "Find leaked secrets, hardcoded credentials, overly broad permissions."
+  #   verdict:
+  #     mode: request_changes
+  #     min_severity: high
+  #     post_inline: true
+
+global_verdict:
+  strategy: any_blocking # any_blocking | max_severity | majority
+  sticky_comment: true
+  fail_check_on_request_changes: false
