@@ -30,7 +30,7 @@ providers:
     # json_mode: false                     # drop response_format for strict APIs
     # extra_body: { temperature: 0.1 }     # merged into request JSON
     # retries: 2                           # retry budget for empty/5xx/429/network (0-5)
-    # timeout_s: 110                       # per-attempt HTTP timeout, seconds
+    # timeout_s: 420                       # per-attempt TOTAL cap, seconds (idle watchdog: 90s)
 
 reviews:
   - id: general-quality

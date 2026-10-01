@@ -43,9 +43,10 @@ export const ProviderConfig = z.object({
   // Retry budget for transient failures (empty content, 5xx, 429, network).
   // Total failure throws into the PR's agent-error block instead of silent empty.
   retries: z.number().int().min(0).max(5).default(2),
-  // Per-attempt HTTP timeout in seconds (default 110, under Cloudflare's 120s
-  // proxy cutoff). A hung gateway connection must fail fast, not block minutes.
-  timeout_s: z.number().int().min(10).max(600).default(110),
+  // Per-attempt HTTP timeout in seconds (default 420, max 600). This is a TOTAL
+  // cap; an always-on 90s idle watchdog kills dead hangs fast while slow but
+  // streaming responses survive to the cap. Worst case ≈ attempts × timeout_s.
+  timeout_s: z.number().int().min(10).max(600).default(420),
   // Send response_format json_object (openai-chat). Disable for providers that reject it.
   json_mode: z.boolean().default(true),
   // Extra JSON body fields merged into the request (provider-specific params).

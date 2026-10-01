@@ -44,6 +44,46 @@ function truncate(s: string, n: number): string {
   return s.length > n ? s.slice(0, n) + "\n...[truncated]" : s;
 }
 
+/** Read a response body with an idle watchdog: any 90s window without a single
+ * byte kills the request. Slow-but-streaming gateways survive; dead hangs die
+ * fast. Total cap is enforced separately by the caller's AbortController. */
+async function readBodyWithIdleTimeout(
+  res: Response,
+  idleMs: number,
+  label: string
+): Promise<string> {
+  const body = res.body;
+  if (!body) return res.text();
+  const reader = body.getReader();
+  const chunks: Uint8Array[] = [];
+  let received = 0;
+  const fail = () => {
+    try {
+      reader.cancel();
+    } catch {
+      // ignore
+    }
+  };
+  try {
+    for (;;) {
+      const timer = setTimeout(fail, idleMs);
+      let read;
+      try {
+        read = await reader.read();
+      } finally {
+        clearTimeout(timer);
+      }
+      if (read.done) break;
+      received += read.value.byteLength;
+      chunks.push(read.value);
+    }
+  } catch (e) {
+    throw new Error(`${label}: idle timeout (no bytes for ${idleMs / 1000}s, got ${received} so far)`);
+  }
+  const buf = Buffer.concat(chunks.map((c) => Buffer.from(c)));
+  return buf.toString("utf8");
+}
+
 async function callAnthropic(opts: {
   apiKey: string;
   baseUrl: string;
@@ -71,13 +111,15 @@ async function callAnthropic(opts: {
       }),
       signal: ctrl.signal,
     });
-    if (!res.ok) throw new Error(`anthropic ${res.status}: ${await res.text()}`);
-    const j = (await res.json()) as any;
-    const text = (j.content ?? [])
+    // Idle 90s: streaming (slow) responses survive, dead hangs die fast.
+    const text = await readBodyWithIdleTimeout(res, 90000, "anthropic");
+    if (!res.ok) throw new Error(`anthropic ${res.status}: ${text}`);
+    const j = JSON.parse(text) as any;
+    const out = (j.content ?? [])
       .filter((b: any) => b.type === "text")
       .map((b: any) => b.text)
       .join("\n");
-    return text;
+    return out;
   } catch (e) {
     if ((e as Error).name === "AbortError")
       throw new Error(`timeout after ${opts.timeoutMs}ms`);
@@ -120,8 +162,10 @@ async function callOpenAICompatible(opts: {
       body: JSON.stringify(body),
       signal: ctrl.signal,
     });
-    if (!res.ok) throw new Error(`llm ${base} ${res.status}: ${await res.text()}`);
-    const j = (await res.json()) as any;
+    // Idle 90s: streaming (slow) responses survive, dead hangs die fast.
+    const text = await readBodyWithIdleTimeout(res, 90000, "llm");
+    if (!res.ok) throw new Error(`llm ${base} ${res.status}: ${text}`);
+    const j = JSON.parse(text) as any;
     return j.choices?.[0]?.message?.content ?? '{"findings":[]}';
   } catch (e) {
     if ((e as Error).name === "AbortError")
@@ -255,7 +299,7 @@ export async function runAgent(opts: {
   // Per-attempt timeout bounds hung gateway connections (the 9-minute run was
   // a single fetch hanging ~5 min with no timeout).
   const maxAttempts = 1 + Math.min(Math.max(opts.provider.retries ?? 2, 0), 5);
-  const timeoutMs = (opts.provider.timeout_s ?? 110) * 1000;
+  const timeoutMs = (opts.provider.timeout_s ?? 420) * 1000;
   const started = Date.now();
   let raw = "";
   let lastError = "";

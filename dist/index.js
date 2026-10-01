@@ -44519,9 +44519,10 @@ const ProviderConfig = objectType({
     // Retry budget for transient failures (empty content, 5xx, 429, network).
     // Total failure throws into the PR's agent-error block instead of silent empty.
     retries: numberType().int().min(0).max(5).default(2),
-    // Per-attempt HTTP timeout in seconds (default 110, under Cloudflare's 120s
-    // proxy cutoff). A hung gateway connection must fail fast, not block minutes.
-    timeout_s: numberType().int().min(10).max(600).default(110),
+    // Per-attempt HTTP timeout in seconds (default 420, max 600). This is a TOTAL
+    // cap; an always-on 90s idle watchdog kills dead hangs fast while slow but
+    // streaming responses survive to the cap. Worst case ≈ attempts × timeout_s.
+    timeout_s: numberType().int().min(10).max(600).default(420),
     // Send response_format json_object (openai-chat). Disable for providers that reject it.
     json_mode: booleanType().default(true),
     // Extra JSON body fields merged into the request (provider-specific params).
@@ -44822,6 +44823,46 @@ const SYSTEM_WRAPPER = (lang, instructions) => `You are a senior code reviewer. 
 function truncate(s, n) {
     return s.length > n ? s.slice(0, n) + "\n...[truncated]" : s;
 }
+/** Read a response body with an idle watchdog: any 90s window without a single
+ * byte kills the request. Slow-but-streaming gateways survive; dead hangs die
+ * fast. Total cap is enforced separately by the caller's AbortController. */
+async function readBodyWithIdleTimeout(res, idleMs, label) {
+    const body = res.body;
+    if (!body)
+        return res.text();
+    const reader = body.getReader();
+    const chunks = [];
+    let received = 0;
+    const fail = () => {
+        try {
+            reader.cancel();
+        }
+        catch {
+            // ignore
+        }
+    };
+    try {
+        for (;;) {
+            const timer = setTimeout(fail, idleMs);
+            let read;
+            try {
+                read = await reader.read();
+            }
+            finally {
+                clearTimeout(timer);
+            }
+            if (read.done)
+                break;
+            received += read.value.byteLength;
+            chunks.push(read.value);
+        }
+    }
+    catch (e) {
+        throw new Error(`${label}: idle timeout (no bytes for ${idleMs / 1000}s, got ${received} so far)`);
+    }
+    const buf = Buffer.concat(chunks.map((c) => Buffer.from(c)));
+    return buf.toString("utf8");
+}
 async function callAnthropic(opts) {
     const base = opts.baseUrl.replace(/\/$/, "");
     const ctrl = new AbortController();
@@ -44839,14 +44880,16 @@ async function callAnthropic(opts) {
             }),
             signal: ctrl.signal,
         });
+        // Idle 90s: streaming (slow) responses survive, dead hangs die fast.
+        const text = await readBodyWithIdleTimeout(res, 90000, "anthropic");
         if (!res.ok)
-            throw new Error(`anthropic ${res.status}: ${await res.text()}`);
-        const j = (await res.json());
-        const text = (j.content ?? [])
+            throw new Error(`anthropic ${res.status}: ${text}`);
+        const j = JSON.parse(text);
+        const out = (j.content ?? [])
             .filter((b) => b.type === "text")
             .map((b) => b.text)
             .join("\n");
-        return text;
+        return out;
     }
     catch (e) {
         if (e.name === "AbortError")
@@ -44880,9 +44923,11 @@ async function callOpenAICompatible(opts) {
             body: JSON.stringify(body),
             signal: ctrl.signal,
         });
+        // Idle 90s: streaming (slow) responses survive, dead hangs die fast.
+        const text = await readBodyWithIdleTimeout(res, 90000, "llm");
         if (!res.ok)
-            throw new Error(`llm ${base} ${res.status}: ${await res.text()}`);
-        const j = (await res.json());
+            throw new Error(`llm ${base} ${res.status}: ${text}`);
+        const j = JSON.parse(text);
         return j.choices?.[0]?.message?.content ?? '{"findings":[]}';
     }
     catch (e) {
@@ -44980,7 +45025,7 @@ async function runAgent(opts) {
     // Per-attempt timeout bounds hung gateway connections (the 9-minute run was
     // a single fetch hanging ~5 min with no timeout).
     const maxAttempts = 1 + Math.min(Math.max(opts.provider.retries ?? 2, 0), 5);
-    const timeoutMs = (opts.provider.timeout_s ?? 110) * 1000;
+    const timeoutMs = (opts.provider.timeout_s ?? 420) * 1000;
     const started = Date.now();
     let raw = "";
     let lastError = "";
