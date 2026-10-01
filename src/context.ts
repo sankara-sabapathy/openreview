@@ -1,6 +1,7 @@
 import { readFileSync, readdirSync, statSync, lstatSync, realpathSync } from "node:fs";
 import * as path from "node:path";
 import * as core from "@actions/core";
+import { logInfo, logWarning } from "./logger.js";
 import { matchesAny } from "./reviewer.js";
 
 const SKIP_DIRS = new Set([
@@ -190,7 +191,7 @@ export function buildContextBlock(input: ContextInput): { block: string; stats: 
   const budget = input.maxContextChars;
   if (budget <= 0) {
     const stats = "context: disabled (max_context_chars <= 0)";
-    core.info(stats);
+    logInfo(stats);
     return { block: "", stats };
   }
   const parts: string[] = [];
@@ -319,9 +320,9 @@ export function buildContextBlock(input: ContextInput): { block: string; stats: 
   let stats = `context: ${fullCount} full files, ${extraCount} extra files, ${callerCount} caller excerpts, ${used}/${budget} chars`;
   if (warnings.length > 0) {
     stats += `; warnings: ${warnings.join("; ")}`;
-    for (const w of warnings) core.warning(`context: ${w}`);
+    for (const w of warnings) logWarning(`context: ${w}`);
   }
-  core.info(stats);
+  logInfo(stats);
   if (parts.length === 0) return { block: "", stats };
   return { block: `<context>\n${parts.join("\n\n")}\n</context>`, stats };
 }

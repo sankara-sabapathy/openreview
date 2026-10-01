@@ -44589,6 +44589,71 @@ function parseConfig(raw) {
 
 ;// CONCATENATED MODULE: external "node:path"
 const external_node_path_namespaceObject = __WEBPACK_EXTERNAL_createRequire(import.meta.url)("node:path");
+;// CONCATENATED MODULE: ./dist-src/logger.js
+
+const ORDER = { debug: 0, info: 1, warn: 2, error: 3 };
+let level = "info";
+let initialized = false;
+function parseLevel(raw) {
+    const v = raw.trim().toLowerCase();
+    if (v === "debug" || v === "info" || v === "warn" || v === "error")
+        return v;
+    core.warning(`Unknown log-level '${raw}', falling back to info`);
+    return "info";
+}
+/** Call once at startup (reads the log-level action input, default info). */
+function initLogger() {
+    if (!initialized) {
+        try {
+            level = parseLevel(core.getInput("log-level") || "info");
+        }
+        catch {
+            level = "info";
+        }
+        initialized = true;
+        core.info(`OpenReview log level: ${level}`);
+    }
+    return level;
+}
+/** Test hook: pin the level without reading action inputs. */
+function setLogLevelForTests(next) {
+    level = next;
+    initialized = true;
+}
+function enabled(at) {
+    return ORDER[at] >= ORDER[level];
+}
+function logDebug(message) {
+    if (enabled("debug"))
+        core.debug(message);
+}
+function logInfo(message) {
+    if (enabled("info"))
+        core.info(message);
+}
+function logWarning(message) {
+    if (enabled("warn"))
+        core.warning(message);
+}
+function redactUrl(url) {
+    return url; // URLs never carry keys in this codebase (keys go in headers)
+}
+function redactHeaders(headers) {
+    const out = {};
+    for (const [k, v] of Object.entries(headers)) {
+        const low = k.toLowerCase();
+        // Never print key material: scheme prefix only (e.g. "Bearer"), never the key.
+        out[k] =
+            low === "authorization" || low === "x-api-key" || low === "api-key"
+                ? v
+                    ? v.replace(/\S+$/, "***")
+                    : "(not set)"
+                : v;
+    }
+    return out;
+}
+
+
 ;// CONCATENATED MODULE: ./dist-src/templates.js
 
 
@@ -44657,7 +44722,7 @@ async function resolveOne(entry, ctx) {
         const file = builtinPath(ctx, builtin[1]);
         if (!file)
             throw new Error(`unknown built-in template '${builtin[1]}' (see templates/ + docs)`);
-        core.info(`Template ${entry}: built-in ${file}`);
+        logInfo(`Template ${entry}: built-in ${file}`);
         return { source: entry, sha: null, config: parsePartial(await loadYamlFile(file)) };
     }
     // Remote: github:owner/repo[/path]@sha:<hex>|@<40-hex> (immutable pin REQUIRED)
@@ -44669,7 +44734,7 @@ async function resolveOne(entry, ctx) {
             throw new Error(`template '${entry}': remote refs must pin an immutable commit SHA (@sha:<40-hex>). Branch tags auto-update and would silently change your reviews.`);
         }
         const filePath = p || "openreview-template.yml";
-        core.info(`Template ${entry}: remote ${owner}/${repo}@${sha.slice(0, 7)}/${filePath}`);
+        logInfo(`Template ${entry}: remote ${owner}/${repo}@${sha.slice(0, 7)}/${filePath}`);
         return { source: entry, sha, config: parsePartial(await fetchRemote(owner, repo, filePath, sha, ctx)) };
     }
     // Local file: ./x.yml, ../x.yml, /abs/x.yml, file:x.yml
@@ -44677,7 +44742,7 @@ async function resolveOne(entry, ctx) {
         const file = localPath(ctx, entry);
         if (!(0,external_node_fs_namespaceObject.existsSync)(file))
             throw new Error(`template file not found: ${file} (from '${entry}')`);
-        core.info(`Template ${entry}: local ${file}`);
+        logInfo(`Template ${entry}: local ${file}`);
         return { source: entry, sha: null, config: parsePartial(await loadYamlFile(file)) };
     }
     throw new Error(`template '${entry}': unknown form. Use openreview:<name>[@v], github:<owner>/<repo>[/path]@sha:<hex>, or ./local.yml`);
@@ -44946,21 +45011,24 @@ async function runAgent(opts) {
             raw = "";
         }
         if (attempt < maxAttempts && isRetryableError(lastError)) {
-            core.warning(`Agent ${opts.agentName}: attempt ${attempt}/${maxAttempts} failed (${lastError.slice(0, 160)}); retrying`);
+            logWarning(`Agent ${opts.agentName}: attempt ${attempt}/${maxAttempts} failed (${lastError.slice(0, 160)}); retrying`);
             await sleep(2000 * attempt);
         }
         else if (attempt < maxAttempts) {
             break; // non-retryable (auth/shape) — fail fast
         }
     }
-    core.info(`Agent ${opts.agentName}: done in ${((Date.now() - started) / 1000).toFixed(1)}s`);
+    logInfo(`Agent ${opts.agentName}: done in ${((Date.now() - started) / 1000).toFixed(1)}s`);
+    logDebug(`Agent ${opts.agentName}: ${rp.protocol} ${rp.baseUrl}${rp.endpointPath} model=${opts.provider.model} ` +
+        `headers=${JSON.stringify(redactHeaders(rp.headers))} ` +
+        `prompt=${system.length + user.length} chars (diff ${opts.diff.length}, ctx ${(opts.contextBlock ?? "").length})`);
     if (!raw.trim()) {
         // Total failure surfaces into the PR's agent-error block (main.ts catch).
         throw new Error(`Agent ${opts.agentName} failed after ${maxAttempts} attempt(s): ${lastError}`);
     }
     const parsed = extractFindingsJson(raw);
     if (!parsed) {
-        core.warning(`Agent ${opts.agentName}: could not parse findings JSON; raw head: ${raw.slice(0, 300)}`);
+        logWarning(`Agent ${opts.agentName}: could not parse findings JSON; raw head: ${raw.slice(0, 300)}`);
         return [];
     }
     try {
@@ -44984,7 +45052,7 @@ async function runAgent(opts) {
     }
     catch (e) {
         // Validation of individual findings failed — warn, don't silently drop everything.
-        core.warning(`Agent ${opts.agentName}: findings validation failed (${e.message}); raw head: ${raw.slice(0, 200)}`);
+        logWarning(`Agent ${opts.agentName}: findings validation failed (${e.message}); raw head: ${raw.slice(0, 200)}`);
         return [];
     }
 }
@@ -45148,10 +45216,14 @@ function runningActionVersion(env) {
 
 ;// CONCATENATED MODULE: ./dist-src/github.js
 const STICKY_MARKER = "<!-- openreview:sticky -->";
+const LOGO_URL = "https://raw.githubusercontent.com/sankara-sabapathy/openreview/v1/assets/logo.svg";
 function renderStickyBody(opts) {
     const lines = [];
     lines.push(STICKY_MARKER);
-    lines.push(`## OpenReview — ${opts.verdict.replace(/_/g, " ").toUpperCase()}`);
+    lines.push(`<img src="${LOGO_URL}" width="28" height="28" align="left" alt="OpenReview AI" />`);
+    lines.push(`## OpenReview AI — ${opts.verdict.replace(/_/g, " ").toUpperCase()}`);
+    lines.push("");
+    lines.push("<br />");
     lines.push("");
     for (const r of opts.perReview)
         lines.push(`- \`${r.id}\`: **${r.verdict}** (${r.count} findings)`);
@@ -45195,7 +45267,7 @@ async function createInlineReview(octokit, owner, repo, pullNumber, commitSha, v
         .map((f) => ({ path: f.file, line: f.line, body: f.comment }));
     await octokit.rest.pulls.createReview({
         owner, repo, pull_number: pullNumber, commit_id: commitSha, event: event,
-        body: `OpenReview: ${verdict} (${findings.length} findings)`,
+        body: `<img src="${LOGO_URL}" width="20" height="20" alt="OpenReview AI" /> **OpenReview AI:** ${verdict} (${findings.length} findings)`,
         comments: comments,
     });
 }
@@ -45391,7 +45463,7 @@ function buildContextBlock(input) {
     const budget = input.maxContextChars;
     if (budget <= 0) {
         const stats = "context: disabled (max_context_chars <= 0)";
-        core.info(stats);
+        logInfo(stats);
         return { block: "", stats };
     }
     const parts = [];
@@ -45531,15 +45603,16 @@ function buildContextBlock(input) {
     if (warnings.length > 0) {
         stats += `; warnings: ${warnings.join("; ")}`;
         for (const w of warnings)
-            core.warning(`context: ${w}`);
+            logWarning(`context: ${w}`);
     }
-    core.info(stats);
+    logInfo(stats);
     if (parts.length === 0)
         return { block: "", stats };
     return { block: `<context>\n${parts.join("\n\n")}\n</context>`, stats };
 }
 
 ;// CONCATENATED MODULE: ./dist-src/main.js
+
 
 
 
@@ -45573,7 +45646,7 @@ async function loadConfig(configPath) {
         const { merged, sources } = await resolveExtends(extendsEntries, ctx);
         const { extends: _ignored, ...top } = loose;
         const config = parseConfig(mergeConfigs(merged, top));
-        core.info(`Resolved ${sources.length} template(s): ${sources
+        logInfo(`Resolved ${sources.length} template(s): ${sources
             .map((s) => (s.sha ? `${s.source} @${s.sha.slice(0, 7)}` : s.source))
             .join(", ")}`);
         return { config, path: p };
@@ -45594,6 +45667,7 @@ async function getPrDiff(octokit, owner, repo, pr) {
 }
 async function run() {
     try {
+        initLogger();
         const token = process.env["INPUT_GITHUB-TOKEN"] || process.env.GITHUB_TOKEN || "";
         if (!token)
             throw new Error("Missing github-token (GITHUB_TOKEN).");
@@ -45604,14 +45678,14 @@ async function run() {
             (issue?.pull_request ? issue.number : undefined) ??
             Number(process.env.PR_NUMBER ?? 0);
         if (!prNumber) {
-            core.warning("No pull_request context; nothing to review. (Supports pull_request + issue_comment /review)");
+            logWarning("No pull_request context; nothing to review. (Supports pull_request + issue_comment /review)");
             return;
         }
         const { owner, repo } = ctx.repo;
         const configPath = core.getInput("config-path") || ".github/openreview.yml";
         const dryRun = (core.getInput("dry-run") || "false").toLowerCase() === "true";
         const { config, path } = await loadConfig(configPath);
-        core.info(`Loaded config: ${path} (${config.reviews.length} reviews)`);
+        logInfo(`Loaded config: ${path} (${config.reviews.length} reviews)`);
         if (config.requires_action) {
             const running = runningActionVersion(process.env);
             if (running && !satisfiesActionVersion(config.requires_action, running)) {
@@ -45622,17 +45696,20 @@ async function run() {
         const keys = resolveKeysFromEnv(process.env);
         // Stable session per workflow run (required by OpenCode Go/Zen routing).
         const sessionId = process.env.GITHUB_RUN_ID ?? `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+        logInfo(`Reviewing PR #${prNumber} in ${owner}/${repo}`);
         const { fileNames, diff, headSha } = await getPrDiff(octokit, owner, repo, prNumber);
+        logInfo(`Diff: ${fileNames.length} files, ${diff.length} chars (head ${headSha.slice(0, 7)})`);
+        logDebug(`Diff files: ${fileNames.join(", ")}`);
         const inScope = filterIgnored(fileNames, config.defaults.ignore ?? []);
         if (!diff.trim() || inScope.length === 0) {
-            core.info("Empty diff or all files ignored.");
+            logInfo("Empty diff or all files ignored.");
             return;
         }
         const perReview = [];
         for (const review of config.reviews) {
             const scopedFiles = inScope.filter((f) => matchesAny(f, review.if_paths));
             if (scopedFiles.length === 0) {
-                core.info(`Review ${review.id}: no matching paths, skipped.`);
+                logInfo(`Review ${review.id}: no matching paths, skipped.`);
                 continue;
             }
             // Build a scoped diff (best-effort: filter diff hunks by filename header)
@@ -45651,10 +45728,13 @@ async function run() {
                 { ...review.main, name: review.main.name ?? `${review.id}:main` },
                 ...review.subagents.map((s, i) => ({ ...s, name: s.name ?? `${review.id}:sub${i}` })),
             ];
+            logInfo(`Review ${review.id}: launching ${agentDefs.length} agent(s) [${agentDefs
+                .map((a) => `${a.name}/${a.provider}`)
+                .join(", ")}] on ${scopedFiles.length} file(s), strategy=${review.strategy}`);
             for (const a of agentDefs) {
                 const provider = config.providers[a.provider];
                 if (!provider) {
-                    core.warning(`Review ${review.id}: unknown provider '${a.provider}', skipped agent ${a.name}.`);
+                    logWarning(`Review ${review.id}: unknown provider '${a.provider}', skipped agent ${a.name}.`);
                     continue;
                 }
                 tasks.push(runAgent({
@@ -45672,7 +45752,7 @@ async function run() {
                     .then((findings) => ({ findings, agent: a.name ?? "agent" }))
                     .catch((e) => {
                     const msg = e.message;
-                    core.warning(`Agent ${a.name} failed: ${msg}`);
+                    logWarning(`Agent ${a.name} failed: ${msg}`);
                     return { findings: [], error: msg, agent: a.name ?? "agent" };
                 }));
             }
@@ -45694,13 +45774,13 @@ async function run() {
                 }
                 const ballots = [...byProvider.entries()].map(([name, fs]) => {
                     const v = decideReviewVerdict(review.verdict.mode, review.verdict.min_severity, fs);
-                    core.info(`Review ${review.id}: ballot ${name} -> ${v} (${fs.length} findings)`);
+                    logInfo(`Review ${review.id}: ballot ${name} -> ${v} (${fs.length} findings)`);
                     return v;
                 });
                 return combineBallots(ballots, review.strategy);
             })();
             perReview.push({ id: review.id, verdict, findings, errors: agentErrors });
-            core.info(`Review ${review.id}: ${findings.length} findings -> ${verdict}`);
+            logInfo(`Review ${review.id}: ${findings.length} findings -> ${verdict}`);
         }
         const global = combineVerdicts(perReview.map((r) => r.verdict), config.global_verdict.strategy);
         const all = perReview.flatMap((r) => r.findings);
@@ -45722,18 +45802,21 @@ async function run() {
             sticky += `\n\n<details><summary>⚠️ All agents failed — details</summary>\n\n${allErrors.join("\n")}\n\nCheck model IDs and base URLs against provider docs.</details>`;
         }
         if (dryRun) {
-            core.info(`DRY RUN verdict=${global}\n${sticky.slice(0, 2000)}`);
+            logInfo(`DRY RUN verdict=${global}\n${sticky.slice(0, 2000)}`);
             return;
         }
-        if (config.global_verdict.sticky_comment)
+        if (config.global_verdict.sticky_comment) {
             await upsertStickyComment(octokit, owner, repo, prNumber, sticky);
+            logInfo(`Published sticky comment (verdict ${global}, ${all.length} findings).`);
+        }
         const wantInline = perReview.some((r) => r.findings.length > 0);
         if (wantInline) {
             try {
                 await createInlineReview(octokit, owner, repo, prNumber, headSha, global, all);
+                logInfo(`Published inline review (${global}).`);
             }
             catch (e) {
-                core.warning(`Inline review failed (non-fatal): ${e.message}`);
+                logWarning(`Inline review failed (non-fatal): ${e.message}`);
             }
         }
         if (global === "request_changes" && config.global_verdict.fail_check_on_request_changes)

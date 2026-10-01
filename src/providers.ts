@@ -1,5 +1,6 @@
 import type { ProviderConfig, ProviderProtocol } from "./config.js";
 import * as core from "@actions/core";
+import { logInfo, logWarning, logDebug, redactHeaders } from "./logger.js";
 
 export type ResolvedKeys = {
   anthropicApiKey: string;
@@ -294,7 +295,7 @@ export async function runAgent(opts: {
       raw = "";
     }
     if (attempt < maxAttempts && isRetryableError(lastError)) {
-      core.warning(
+      logWarning(
         `Agent ${opts.agentName}: attempt ${attempt}/${maxAttempts} failed (${lastError.slice(0, 160)}); retrying`
       );
       await sleep(2000 * attempt);
@@ -302,8 +303,13 @@ export async function runAgent(opts: {
       break; // non-retryable (auth/shape) — fail fast
     }
   }
-  core.info(
+  logInfo(
     `Agent ${opts.agentName}: done in ${((Date.now() - started) / 1000).toFixed(1)}s`
+  );
+  logDebug(
+    `Agent ${opts.agentName}: ${rp.protocol} ${rp.baseUrl}${rp.endpointPath} model=${opts.provider.model} ` +
+      `headers=${JSON.stringify(redactHeaders(rp.headers))} ` +
+      `prompt=${system.length + user.length} chars (diff ${opts.diff.length}, ctx ${(opts.contextBlock ?? "").length})`
   );
   if (!raw.trim()) {
     // Total failure surfaces into the PR's agent-error block (main.ts catch).
@@ -311,7 +317,7 @@ export async function runAgent(opts: {
   }
   const parsed = extractFindingsJson(raw);
   if (!parsed) {
-    core.warning(
+    logWarning(
       `Agent ${opts.agentName}: could not parse findings JSON; raw head: ${raw.slice(0, 300)}`
     );
     return [];
@@ -336,7 +342,7 @@ export async function runAgent(opts: {
     return out;
   } catch (e) {
     // Validation of individual findings failed — warn, don't silently drop everything.
-    core.warning(
+    logWarning(
       `Agent ${opts.agentName}: findings validation failed (${(e as Error).message}); raw head: ${raw.slice(0, 200)}`
     );
     return [];

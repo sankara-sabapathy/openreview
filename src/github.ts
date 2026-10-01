@@ -1,6 +1,8 @@
 import * as github from "@actions/github";
 
 export const STICKY_MARKER = "<!-- openreview:sticky -->";
+export const LOGO_URL =
+  "https://raw.githubusercontent.com/sankara-sabapathy/openreview/v1/assets/logo.svg";
 
 export function renderStickyBody(opts: {
   verdict: string;
@@ -18,7 +20,12 @@ export function renderStickyBody(opts: {
 }): string {
   const lines: string[] = [];
   lines.push(STICKY_MARKER);
-  lines.push(`## OpenReview — ${opts.verdict.replace(/_/g, " ").toUpperCase()}`);
+  lines.push(
+    `<img src="${LOGO_URL}" width="28" height="28" align="left" alt="OpenReview AI" />`
+  );
+  lines.push(`## OpenReview AI — ${opts.verdict.replace(/_/g, " ").toUpperCase()}`);
+  lines.push("");
+  lines.push("<br />");
   lines.push("");
   for (const r of opts.perReview)
     lines.push(`- \`${r.id}\`: **${r.verdict}** (${r.count} findings)`);
@@ -75,7 +82,7 @@ export async function createInlineReview(
     .map((f) => ({ path: f.file, line: f.line as number, body: f.comment }));
   await octokit.rest.pulls.createReview({
     owner, repo, pull_number: pullNumber, commit_id: commitSha, event: event as any,
-    body: `OpenReview: ${verdict} (${findings.length} findings)`,
+    body: `<img src="${LOGO_URL}" width="20" height="20" alt="OpenReview AI" /> **OpenReview AI:** ${verdict} (${findings.length} findings)`,
     comments: comments as any,
   });
 }

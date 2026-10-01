@@ -3,6 +3,7 @@ import { existsSync } from "node:fs";
 import * as path from "node:path";
 import * as YAML from "yaml";
 import * as core from "@actions/core";
+import { logInfo } from "./logger.js";
 import { OpenReviewConfig, type OpenReviewConfig as Config } from "./config.js";
 
 type PartialConfig = Partial<{
@@ -98,7 +99,7 @@ async function resolveOne(
   if (builtin) {
     const file = builtinPath(ctx, builtin[1]);
     if (!file) throw new Error(`unknown built-in template '${builtin[1]}' (see templates/ + docs)`);
-    core.info(`Template ${entry}: built-in ${file}`);
+    logInfo(`Template ${entry}: built-in ${file}`);
     return { source: entry, sha: null, config: parsePartial(await loadYamlFile(file)) };
   }
   // Remote: github:owner/repo[/path]@sha:<hex>|@<40-hex> (immutable pin REQUIRED)
@@ -112,14 +113,14 @@ async function resolveOne(
       );
     }
     const filePath = p || "openreview-template.yml";
-    core.info(`Template ${entry}: remote ${owner}/${repo}@${sha.slice(0, 7)}/${filePath}`);
+    logInfo(`Template ${entry}: remote ${owner}/${repo}@${sha.slice(0, 7)}/${filePath}`);
     return { source: entry, sha, config: parsePartial(await fetchRemote(owner, repo, filePath, sha, ctx)) };
   }
   // Local file: ./x.yml, ../x.yml, /abs/x.yml, file:x.yml
   if (/^(\.|file:|\/)/.test(entry)) {
     const file = localPath(ctx, entry);
     if (!existsSync(file)) throw new Error(`template file not found: ${file} (from '${entry}')`);
-    core.info(`Template ${entry}: local ${file}`);
+    logInfo(`Template ${entry}: local ${file}`);
     return { source: entry, sha: null, config: parsePartial(await loadYamlFile(file)) };
   }
   throw new Error(

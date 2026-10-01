@@ -1,6 +1,9 @@
 # Troubleshooting
 
 - `No config found`: add `.github/openreview.yml`.
+- Need more signal? Set `log-level: debug` on the action step: per-agent endpoint
+  (keys redacted), prompt sizes, and resolved config. Default `info` already logs
+  reviews, ballots, timings, and publish confirmations.
 - `unknown provider`: check `providers{}` keys match `main.provider` / `subagents[].provider`.
 - Empty review: check `if_paths` / `defaults.ignore` and diff size (`max_diff_chars`).
 - `Inline review failed`: non-fatal; sticky comment is source of truth (commit SHA or permission issue).

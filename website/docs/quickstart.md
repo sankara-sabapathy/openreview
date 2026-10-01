@@ -36,6 +36,7 @@ jobs:
           opencode-api-key: ${{ secrets.OPENCODE_API_KEY }}
           # anthropic-api-key: ${{ secrets.ANTHROPIC_API_KEY }}
           # openai-api-key: ${{ secrets.OPENAI_API_KEY }}
+          # log-level: debug # debug | info (default) | warn | error
 ```
 
 ## 2. Add secrets

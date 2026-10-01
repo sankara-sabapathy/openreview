@@ -33,6 +33,10 @@ inputs:
     description: "If true, log verdict without posting"
     required: false
     default: "false"
+  log-level:
+    description: "Log verbosity: debug, info (default), warn, error"
+    required: false
+    default: "info"
 outputs:
   verdict:
     description: "Global verdict: approve|comment|request_changes"

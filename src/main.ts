@@ -12,6 +12,7 @@ import {
   satisfiesActionVersion, runningActionVersion,
 } from "./reviewer.js";
 import { renderStickyBody, upsertStickyComment, createInlineReview } from "./github.js";
+import { initLogger, logInfo, logWarning, logDebug } from "./logger.js";
 import { buildContextBlock } from "./context.js";
 
 const CONFIG_CANDIDATES = [
@@ -36,7 +37,7 @@ async function loadConfig(configPath: string) {
     const { merged, sources } = await resolveExtends(extendsEntries, ctx);
     const { extends: _ignored, ...top } = loose;
     const config = parseConfig(mergeConfigs(merged, top) as unknown);
-    core.info(
+    logInfo(
       `Resolved ${sources.length} template(s): ${sources
         .map((s) => (s.sha ? `${s.source} @${s.sha.slice(0, 7)}` : s.source))
         .join(", ")}`
@@ -62,6 +63,7 @@ async function getPrDiff(octokit: ReturnType<typeof github.getOctokit>, owner: s
 
 export async function run(): Promise<void> {
   try {
+    initLogger();
     const token = process.env["INPUT_GITHUB-TOKEN"] || process.env.GITHUB_TOKEN || "";
     if (!token) throw new Error("Missing github-token (GITHUB_TOKEN).");
     const octokit = github.getOctokit(token);
@@ -72,7 +74,7 @@ export async function run(): Promise<void> {
       (issue?.pull_request ? issue.number : undefined) ??
       Number(process.env.PR_NUMBER ?? 0);
     if (!prNumber) {
-      core.warning("No pull_request context; nothing to review. (Supports pull_request + issue_comment /review)");
+      logWarning("No pull_request context; nothing to review. (Supports pull_request + issue_comment /review)");
       return;
     }
     const { owner, repo } = ctx.repo;
@@ -80,7 +82,7 @@ export async function run(): Promise<void> {
     const dryRun = (core.getInput("dry-run") || "false").toLowerCase() === "true";
 
     const { config, path } = await loadConfig(configPath);
-    core.info(`Loaded config: ${path} (${config.reviews.length} reviews)`);
+    logInfo(`Loaded config: ${path} (${config.reviews.length} reviews)`);
     if (config.requires_action) {
       const running = runningActionVersion(process.env as any);
       if (running && !satisfiesActionVersion(config.requires_action, running)) {
@@ -94,10 +96,13 @@ export async function run(): Promise<void> {
     // Stable session per workflow run (required by OpenCode Go/Zen routing).
     const sessionId =
       process.env.GITHUB_RUN_ID ?? `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    logInfo(`Reviewing PR #${prNumber} in ${owner}/${repo}`);
     const { fileNames, diff, headSha } = await getPrDiff(octokit, owner, repo, prNumber);
+    logInfo(`Diff: ${fileNames.length} files, ${diff.length} chars (head ${headSha.slice(0, 7)})`);
+    logDebug(`Diff files: ${fileNames.join(", ")}`);
     const inScope = filterIgnored(fileNames, config.defaults.ignore ?? []);
     if (!diff.trim() || inScope.length === 0) {
-      core.info("Empty diff or all files ignored.");
+      logInfo("Empty diff or all files ignored.");
       return;
     }
 
@@ -105,7 +110,7 @@ export async function run(): Promise<void> {
     for (const review of config.reviews) {
       const scopedFiles = inScope.filter((f) => matchesAny(f, review.if_paths));
       if (scopedFiles.length === 0) {
-        core.info(`Review ${review.id}: no matching paths, skipped.`);
+        logInfo(`Review ${review.id}: no matching paths, skipped.`);
         continue;
       }
       // Build a scoped diff (best-effort: filter diff hunks by filename header)
@@ -126,10 +131,15 @@ export async function run(): Promise<void> {
         { ...review.main, name: review.main.name ?? `${review.id}:main` },
         ...review.subagents.map((s, i) => ({ ...s, name: s.name ?? `${review.id}:sub${i}` })),
       ];
+      logInfo(
+        `Review ${review.id}: launching ${agentDefs.length} agent(s) [${agentDefs
+          .map((a) => `${a.name}/${a.provider}`)
+          .join(", ")}] on ${scopedFiles.length} file(s), strategy=${review.strategy}`
+      );
       for (const a of agentDefs) {
         const provider = config.providers[a.provider];
         if (!provider) {
-          core.warning(`Review ${review.id}: unknown provider '${a.provider}', skipped agent ${a.name}.`);
+          logWarning(`Review ${review.id}: unknown provider '${a.provider}', skipped agent ${a.name}.`);
           continue;
         }
         tasks.push(
@@ -148,7 +158,7 @@ export async function run(): Promise<void> {
             .then((findings) => ({ findings, agent: a.name ?? "agent" }))
             .catch((e) => {
               const msg = (e as Error).message;
-              core.warning(`Agent ${a.name} failed: ${msg}`);
+              logWarning(`Agent ${a.name} failed: ${msg}`);
               return { findings: [] as Finding[], error: msg, agent: a.name ?? "agent" };
             })
         );
@@ -172,13 +182,13 @@ export async function run(): Promise<void> {
         }
         const ballots = [...byProvider.entries()].map(([name, fs]) => {
           const v = decideReviewVerdict(review.verdict.mode, review.verdict.min_severity, fs);
-          core.info(`Review ${review.id}: ballot ${name} -> ${v} (${fs.length} findings)`);
+          logInfo(`Review ${review.id}: ballot ${name} -> ${v} (${fs.length} findings)`);
           return v;
         });
         return combineBallots(ballots, review.strategy);
       })();
       perReview.push({ id: review.id, verdict, findings, errors: agentErrors });
-      core.info(`Review ${review.id}: ${findings.length} findings -> ${verdict}`);
+      logInfo(`Review ${review.id}: ${findings.length} findings -> ${verdict}`);
     }
 
     const global = combineVerdicts(
@@ -205,17 +215,20 @@ export async function run(): Promise<void> {
     }
 
     if (dryRun) {
-      core.info(`DRY RUN verdict=${global}\n${sticky.slice(0, 2000)}`);
+      logInfo(`DRY RUN verdict=${global}\n${sticky.slice(0, 2000)}`);
       return;
     }
-    if (config.global_verdict.sticky_comment)
+    if (config.global_verdict.sticky_comment) {
       await upsertStickyComment(octokit, owner, repo, prNumber, sticky);
+      logInfo(`Published sticky comment (verdict ${global}, ${all.length} findings).`);
+    }
     const wantInline = perReview.some((r) => r.findings.length > 0);
     if (wantInline) {
       try {
         await createInlineReview(octokit, owner, repo, prNumber, headSha, global, all);
+        logInfo(`Published inline review (${global}).`);
       } catch (e) {
-        core.warning(`Inline review failed (non-fatal): ${(e as Error).message}`);
+        logWarning(`Inline review failed (non-fatal): ${(e as Error).message}`);
       }
     }
     if (global === "request_changes" && config.global_verdict.fail_check_on_request_changes)

@@ -146,3 +146,18 @@ describe("misc", () => {
     assert.ok(!isRetryableError("llm https://x 401: bad key"));
   });
 });
+
+describe("logger", () => {
+  it("redacts key material from headers", async () => {
+    const { redactHeaders } = await import("./logger.js");
+    const out = redactHeaders({
+      authorization: "Bearer sk-ant-secret",
+      "x-api-key": "sk-ant-secret",
+      "content-type": "application/json",
+    });
+    assert.equal(out["authorization"], "Bearer ***");
+    assert.equal(out["x-api-key"], "***");
+    assert.equal(out["content-type"], "application/json");
+    assert.ok(!JSON.stringify(out).includes("sk-ant-secret"));
+  });
+});
