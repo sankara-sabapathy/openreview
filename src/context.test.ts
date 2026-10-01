@@ -164,9 +164,10 @@ describe("noise controls", () => {
   });
   it("floor + cap + severity/confidence ordering", async () => {
     const { applyNoiseControls } = await import("./reviewer.js");
-    const H = (c) => ({ severity: "high", confidence: c });
-    const M = (c) => ({ severity: "medium", confidence: c });
-    const S = (c) => ({ severity: "suggestion", confidence: c });
+    type F = { severity: string; confidence: number };
+    const H = (c: number): F => ({ severity: "high", confidence: c });
+    const M = (c: number): F => ({ severity: "medium", confidence: c });
+    const S = (c: number): F => ({ severity: "suggestion", confidence: c });
     const r = applyNoiseControls([S(0.9), H(0.5), M(0.95), H(0.9), S(0.2)], {
       min_confidence: 0.6,
       max_findings: 3,
