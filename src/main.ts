@@ -5,7 +5,7 @@ import { existsSync } from "node:fs";
 import * as YAML from "yaml";
 import { parseConfig } from "./config.js";
 import { templateContextFor, resolveExtends, mergeConfigs, parseConfigLoose } from "./templates.js";
-import { resolveKeysFromEnv, runAgent, type Finding } from "./providers.js";
+import { resolveKeysFromEnv, runAgent, formatTokens, type Finding } from "./providers.js";
 import {
   matchesAny, filterIgnored, dedupeFindings,
   decideReviewVerdict, combineVerdicts, combineBallots, type Verdict,
@@ -106,7 +106,13 @@ export async function run(): Promise<void> {
       return;
     }
 
-    const perReview: { id: string; verdict: Verdict; findings: Finding[]; errors: string[] }[] = [];
+    const perReview: {
+      id: string;
+      verdict: Verdict;
+      findings: Finding[];
+      errors: string[];
+      usage: { agent: string; model: string; usage: { in: number; out: number }; seconds: number }[];
+    }[] = [];
     for (const review of config.reviews) {
       const scopedFiles = inScope.filter((f) => matchesAny(f, review.if_paths));
       if (scopedFiles.length === 0) {
@@ -126,7 +132,14 @@ export async function run(): Promise<void> {
           review.max_context_chars ?? config.defaults.max_context_chars ?? 20000,
         ignore: config.defaults.ignore ?? [],
       });
-      const tasks: Promise<{ findings: Finding[]; error?: string; agent: string }>[] = [];
+      const tasks: Promise<{
+        findings: Finding[];
+        usage: { in: number; out: number } | null;
+        seconds: number;
+        error?: string;
+        agent: string;
+        providerName: string;
+      }>[] = [];
       const agentDefs = [
         { ...review.main, name: review.main.name ?? `${review.id}:main` },
         ...review.subagents.map((s, i) => ({ ...s, name: s.name ?? `${review.id}:sub${i}` })),
@@ -155,11 +168,24 @@ export async function run(): Promise<void> {
             sessionId,
             contextBlock,
           })
-            .then((findings) => ({ findings, agent: a.name ?? "agent" }))
+            .then((result) => ({
+              findings: result.findings,
+              usage: result.usage,
+              seconds: result.seconds,
+              agent: a.name ?? "agent",
+              providerName: a.provider,
+            }))
             .catch((e) => {
               const msg = (e as Error).message;
               logWarning(`Agent ${a.name} failed: ${msg}`);
-              return { findings: [] as Finding[], error: msg, agent: a.name ?? "agent" };
+              return {
+                findings: [] as Finding[],
+                usage: null,
+                seconds: 0,
+                error: msg,
+                agent: a.name ?? "agent",
+                providerName: a.provider,
+              };
             })
         );
       }
@@ -187,7 +213,20 @@ export async function run(): Promise<void> {
         });
         return combineBallots(ballots, review.strategy);
       })();
-      perReview.push({ id: review.id, verdict, findings, errors: agentErrors });
+      perReview.push({
+        id: review.id,
+        verdict,
+        findings,
+        errors: agentErrors,
+        usage: results
+          .filter((r) => r.usage)
+          .map((r) => ({
+            agent: r.agent,
+            model: config.providers[r.providerName]?.model ?? r.providerName,
+            usage: r.usage as { in: number; out: number },
+            seconds: r.seconds,
+          })),
+      });
       logInfo(`Review ${review.id}: ${findings.length} findings -> ${verdict}`);
     }
 
@@ -207,7 +246,29 @@ export async function run(): Promise<void> {
     });
     const hasAnyKey = Boolean(keys.anthropicApiKey || keys.openaiApiKey || keys.opencodeApiKey);
     const allErrors = perReview.flatMap((r) => r.errors);
+    // Consolidated usage, grouped by model: "model 12.3k/1.1k 38t/s".
+    const usageByModel = new Map<string, { In: number; Out: number; seconds: number }>();
+    for (const r of perReview) {
+      for (const u of r.usage) {
+        const e = usageByModel.get(u.model) ?? { In: 0, Out: 0, seconds: 0 };
+        e.In += u.usage.in;
+        e.Out += u.usage.out;
+        e.seconds += u.seconds;
+        usageByModel.set(u.model, e);
+      }
+    }
+    const usageLine = [...usageByModel.entries()]
+      .map(
+        ([m, e]) =>
+          `${m} ${formatTokens(e.In)}/${formatTokens(e.Out)}` +
+          (e.Out > 0 && e.seconds > 0 ? ` ${(e.Out / e.seconds).toFixed(0)}t/s` : "")
+      )
+      .join(" · ");
     let sticky = stickyBase;
+    if (usageLine) {
+      sticky += `\n<sub>Models: ${usageLine}</sub>`;
+      logInfo(`Usage: ${usageLine}`);
+    }
     if (!hasAnyKey) {
       sticky += `\n\n> ⚠️ No provider API keys configured — agents were skipped. Add \`ANTHROPIC_API_KEY\`, \`OPENAI_API_KEY\`, or \`OPENCODE_API_KEY\` as repo Actions secrets (only the ones your \`providers{}\` use).`;
     } else if (all.length === 0 && allErrors.length > 0) {

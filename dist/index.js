@@ -44863,6 +44863,12 @@ async function readBodyWithIdleTimeout(res, idleMs, label) {
     const buf = Buffer.concat(chunks.map((c) => Buffer.from(c)));
     return buf.toString("utf8");
 }
+/** Compact token counts: 12345 -> "12.3k". */
+function formatTokens(n) {
+    if (n >= 1000)
+        return `${(n / 1000).toFixed(1)}k`;
+    return `${n}`;
+}
 async function callAnthropic(opts) {
     const base = opts.baseUrl.replace(/\/$/, "");
     const ctrl = new AbortController();
@@ -44889,7 +44895,11 @@ async function callAnthropic(opts) {
             .filter((b) => b.type === "text")
             .map((b) => b.text)
             .join("\n");
-        return out;
+        const u = j.usage ?? {};
+        const usage = typeof u.input_tokens === "number" || typeof u.output_tokens === "number"
+            ? { in: u.input_tokens ?? 0, out: u.output_tokens ?? 0 }
+            : null;
+        return { text: out, usage };
     }
     catch (e) {
         if (e.name === "AbortError")
@@ -44928,7 +44938,11 @@ async function callOpenAICompatible(opts) {
         if (!res.ok)
             throw new Error(`llm ${base} ${res.status}: ${text}`);
         const j = JSON.parse(text);
-        return j.choices?.[0]?.message?.content ?? '{"findings":[]}';
+        const u = j.usage ?? {};
+        const usage = typeof u.prompt_tokens === "number" || typeof u.completion_tokens === "number"
+            ? { in: u.prompt_tokens ?? 0, out: u.completion_tokens ?? 0 }
+            : null;
+        return { text: j.choices?.[0]?.message?.content ?? '{"findings":[]}', usage };
     }
     catch (e) {
         if (e.name === "AbortError")
@@ -45019,8 +45033,9 @@ async function runAgent(opts) {
         user += `\n\n${opts.contextBlock}\nGround every finding in the diff above; use <context> only as cross-file evidence (callers, types, contracts). Never flag context-only code.`;
     }
     const rp = resolveProvider(opts.provider, opts.keys, process.env, opts.sessionId);
+    // missing BYOK key -> skip silently, caller warns
     if (!rp.apiKey)
-        return []; // missing BYOK key -> skip silently, caller warns
+        return { findings: [], usage: null, seconds: 0 };
     // Retry budget (issue #30): transient empties/5xx must not silently approve.
     // Per-attempt timeout bounds hung gateway connections (the 9-minute run was
     // a single fetch hanging ~5 min with no timeout).
@@ -45028,11 +45043,13 @@ async function runAgent(opts) {
     const timeoutMs = (opts.provider.timeout_s ?? 420) * 1000;
     const started = Date.now();
     let raw = "";
+    let usage = null;
     let lastError = "";
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
         try {
+            let out;
             if (rp.protocol === "anthropic-messages") {
-                raw = await callAnthropic({
+                out = await callAnthropic({
                     apiKey: rp.apiKey,
                     baseUrl: rp.baseUrl,
                     endpointPath: rp.endpointPath,
@@ -45045,7 +45062,7 @@ async function runAgent(opts) {
                 });
             }
             else {
-                raw = await callOpenAICompatible({
+                out = await callOpenAICompatible({
                     apiKey: rp.apiKey,
                     baseUrl: rp.baseUrl,
                     endpointPath: rp.endpointPath,
@@ -45058,14 +45075,18 @@ async function runAgent(opts) {
                     timeoutMs,
                 });
             }
+            raw = out.text;
+            usage = out.usage;
             if (raw && raw.trim())
                 break; // success
             lastError = `empty content from ${opts.provider.model}`;
             raw = "";
+            usage = null;
         }
         catch (e) {
             lastError = e.message;
             raw = "";
+            usage = null;
         }
         if (attempt < maxAttempts && isRetryableError(lastError)) {
             logWarning(`Agent ${opts.agentName}: attempt ${attempt}/${maxAttempts} failed (${lastError.slice(0, 160)}); retrying`);
@@ -45075,7 +45096,12 @@ async function runAgent(opts) {
             break; // non-retryable (auth/shape) — fail fast
         }
     }
-    logInfo(`Agent ${opts.agentName}: done in ${((Date.now() - started) / 1000).toFixed(1)}s`);
+    const seconds = (Date.now() - started) / 1000;
+    const usageStr = usage
+        ? `, ${formatTokens(usage.in)} in / ${formatTokens(usage.out)} out` +
+            (usage.out > 0 && seconds > 0 ? `, ${(usage.out / seconds).toFixed(1)} tok/s` : "")
+        : "";
+    logInfo(`Agent ${opts.agentName}: done in ${seconds.toFixed(1)}s${usageStr}`);
     logDebug(`Agent ${opts.agentName}: ${rp.protocol} ${rp.baseUrl}${rp.endpointPath} model=${opts.provider.model} ` +
         `headers=${JSON.stringify(redactHeaders(rp.headers))} ` +
         `prompt=${system.length + user.length} chars (diff ${opts.diff.length}, ctx ${(opts.contextBlock ?? "").length})`);
@@ -45086,7 +45112,7 @@ async function runAgent(opts) {
     const parsed = extractFindingsJson(raw);
     if (!parsed) {
         logWarning(`Agent ${opts.agentName}: could not parse findings JSON; raw head: ${raw.slice(0, 300)}`);
-        return [];
+        return { findings: [], usage, seconds };
     }
     try {
         const out = [];
@@ -45105,12 +45131,12 @@ async function runAgent(opts) {
                 provider: opts.providerName,
             });
         }
-        return out;
+        return { findings: out, usage, seconds };
     }
     catch (e) {
         // Validation of individual findings failed — warn, don't silently drop everything.
         logWarning(`Agent ${opts.agentName}: findings validation failed (${e.message}); raw head: ${raw.slice(0, 200)}`);
-        return [];
+        return { findings: [], usage, seconds };
     }
 }
 // Parse the findings JSON out of a model response. Tries strict parse first,
@@ -45816,11 +45842,24 @@ async function run() {
                     sessionId,
                     contextBlock,
                 })
-                    .then((findings) => ({ findings, agent: a.name ?? "agent" }))
+                    .then((result) => ({
+                    findings: result.findings,
+                    usage: result.usage,
+                    seconds: result.seconds,
+                    agent: a.name ?? "agent",
+                    providerName: a.provider,
+                }))
                     .catch((e) => {
                     const msg = e.message;
                     logWarning(`Agent ${a.name} failed: ${msg}`);
-                    return { findings: [], error: msg, agent: a.name ?? "agent" };
+                    return {
+                        findings: [],
+                        usage: null,
+                        seconds: 0,
+                        error: msg,
+                        agent: a.name ?? "agent",
+                        providerName: a.provider,
+                    };
                 }));
             }
             const results = await Promise.all(tasks);
@@ -45846,7 +45885,20 @@ async function run() {
                 });
                 return combineBallots(ballots, review.strategy);
             })();
-            perReview.push({ id: review.id, verdict, findings, errors: agentErrors });
+            perReview.push({
+                id: review.id,
+                verdict,
+                findings,
+                errors: agentErrors,
+                usage: results
+                    .filter((r) => r.usage)
+                    .map((r) => ({
+                    agent: r.agent,
+                    model: config.providers[r.providerName]?.model ?? r.providerName,
+                    usage: r.usage,
+                    seconds: r.seconds,
+                })),
+            });
             logInfo(`Review ${review.id}: ${findings.length} findings -> ${verdict}`);
         }
         const global = combineVerdicts(perReview.map((r) => r.verdict), config.global_verdict.strategy);
@@ -45861,7 +45913,26 @@ async function run() {
         });
         const hasAnyKey = Boolean(keys.anthropicApiKey || keys.openaiApiKey || keys.opencodeApiKey);
         const allErrors = perReview.flatMap((r) => r.errors);
+        // Consolidated usage, grouped by model: "model 12.3k/1.1k 38t/s".
+        const usageByModel = new Map();
+        for (const r of perReview) {
+            for (const u of r.usage) {
+                const e = usageByModel.get(u.model) ?? { In: 0, Out: 0, seconds: 0 };
+                e.In += u.usage.in;
+                e.Out += u.usage.out;
+                e.seconds += u.seconds;
+                usageByModel.set(u.model, e);
+            }
+        }
+        const usageLine = [...usageByModel.entries()]
+            .map(([m, e]) => `${m} ${formatTokens(e.In)}/${formatTokens(e.Out)}` +
+            (e.Out > 0 && e.seconds > 0 ? ` ${(e.Out / e.seconds).toFixed(0)}t/s` : ""))
+            .join(" · ");
         let sticky = stickyBase;
+        if (usageLine) {
+            sticky += `\n<sub>Models: ${usageLine}</sub>`;
+            logInfo(`Usage: ${usageLine}`);
+        }
         if (!hasAnyKey) {
             sticky += `\n\n> ⚠️ No provider API keys configured — agents were skipped. Add \`ANTHROPIC_API_KEY\`, \`OPENAI_API_KEY\`, or \`OPENCODE_API_KEY\` as repo Actions secrets (only the ones your \`providers{}\` use).`;
         }

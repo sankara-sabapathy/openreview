@@ -145,6 +145,11 @@ describe("misc", () => {
     assert.ok(isRetryableError("llm https://x 503: down"));
     assert.ok(!isRetryableError("llm https://x 401: bad key"));
   });
+  it("formatTokens compacts", async () => {
+    const { formatTokens } = await import("./providers.js");
+    assert.equal(formatTokens(999), "999");
+    assert.equal(formatTokens(12400), "12.4k");
+  });
 });
 
 describe("logger", () => {

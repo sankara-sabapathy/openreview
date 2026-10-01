@@ -84,6 +84,20 @@ async function readBodyWithIdleTimeout(
   return buf.toString("utf8");
 }
 
+export type Usage = { in: number; out: number } | null;
+
+export type AgentResult = {
+  findings: Finding[];
+  usage: Usage;
+  seconds: number;
+};
+
+/** Compact token counts: 12345 -> "12.3k". */
+export function formatTokens(n: number): string {
+  if (n >= 1000) return `${(n / 1000).toFixed(1)}k`;
+  return `${n}`;
+}
+
 async function callAnthropic(opts: {
   apiKey: string;
   baseUrl: string;
@@ -94,7 +108,7 @@ async function callAnthropic(opts: {
   user: string;
   extraBody: Record<string, unknown>;
   timeoutMs: number;
-}): Promise<string> {
+}): Promise<{ text: string; usage: Usage }> {
   const base = opts.baseUrl.replace(/\/$/, "");
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), opts.timeoutMs);
@@ -119,7 +133,12 @@ async function callAnthropic(opts: {
       .filter((b: any) => b.type === "text")
       .map((b: any) => b.text)
       .join("\n");
-    return out;
+    const u = j.usage ?? {};
+    const usage: Usage =
+      typeof u.input_tokens === "number" || typeof u.output_tokens === "number"
+        ? { in: u.input_tokens ?? 0, out: u.output_tokens ?? 0 }
+        : null;
+    return { text: out, usage };
   } catch (e) {
     if ((e as Error).name === "AbortError")
       throw new Error(`timeout after ${opts.timeoutMs}ms`);
@@ -140,7 +159,7 @@ async function callOpenAICompatible(opts: {
   jsonMode: boolean;
   extraBody: Record<string, unknown>;
   timeoutMs: number;
-}): Promise<string> {
+}): Promise<{ text: string; usage: Usage }> {
   const base = opts.baseUrl.replace(/\/$/, "");
   const body: Record<string, unknown> = {
     model: opts.model,
@@ -166,7 +185,12 @@ async function callOpenAICompatible(opts: {
     const text = await readBodyWithIdleTimeout(res, 90000, "llm");
     if (!res.ok) throw new Error(`llm ${base} ${res.status}: ${text}`);
     const j = JSON.parse(text) as any;
-    return j.choices?.[0]?.message?.content ?? '{"findings":[]}';
+    const u = j.usage ?? {};
+    const usage: Usage =
+      typeof u.prompt_tokens === "number" || typeof u.completion_tokens === "number"
+        ? { in: u.prompt_tokens ?? 0, out: u.completion_tokens ?? 0 }
+        : null;
+    return { text: j.choices?.[0]?.message?.content ?? '{"findings":[]}', usage };
   } catch (e) {
     if ((e as Error).name === "AbortError")
       throw new Error(`timeout after ${opts.timeoutMs}ms`);
@@ -286,14 +310,15 @@ export async function runAgent(opts: {
   maxDiffChars: number;
   sessionId: string;
   contextBlock?: string;
-}): Promise<Finding[]> {
+}): Promise<AgentResult> {
   const system = SYSTEM_WRAPPER(opts.lang, opts.instructions);
   let user = `Review this unified diff (truncated):\n\n${truncate(opts.diff, opts.maxDiffChars)}`;
   if (opts.contextBlock) {
     user += `\n\n${opts.contextBlock}\nGround every finding in the diff above; use <context> only as cross-file evidence (callers, types, contracts). Never flag context-only code.`;
   }
   const rp = resolveProvider(opts.provider, opts.keys, process.env as any, opts.sessionId);
-  if (!rp.apiKey) return []; // missing BYOK key -> skip silently, caller warns
+  // missing BYOK key -> skip silently, caller warns
+  if (!rp.apiKey) return { findings: [], usage: null, seconds: 0 };
 
   // Retry budget (issue #30): transient empties/5xx must not silently approve.
   // Per-attempt timeout bounds hung gateway connections (the 9-minute run was
@@ -302,11 +327,13 @@ export async function runAgent(opts: {
   const timeoutMs = (opts.provider.timeout_s ?? 420) * 1000;
   const started = Date.now();
   let raw = "";
+  let usage: Usage = null;
   let lastError = "";
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     try {
+      let out;
       if (rp.protocol === "anthropic-messages") {
-        raw = await callAnthropic({
+        out = await callAnthropic({
           apiKey: rp.apiKey,
           baseUrl: rp.baseUrl,
           endpointPath: rp.endpointPath,
@@ -318,7 +345,7 @@ export async function runAgent(opts: {
           timeoutMs,
         });
       } else {
-        raw = await callOpenAICompatible({
+        out = await callOpenAICompatible({
           apiKey: rp.apiKey,
           baseUrl: rp.baseUrl,
           endpointPath: rp.endpointPath,
@@ -331,12 +358,16 @@ export async function runAgent(opts: {
           timeoutMs,
         });
       }
+      raw = out.text;
+      usage = out.usage;
       if (raw && raw.trim()) break; // success
       lastError = `empty content from ${opts.provider.model}`;
       raw = "";
+      usage = null;
     } catch (e) {
       lastError = (e as Error).message;
       raw = "";
+      usage = null;
     }
     if (attempt < maxAttempts && isRetryableError(lastError)) {
       logWarning(
@@ -347,9 +378,12 @@ export async function runAgent(opts: {
       break; // non-retryable (auth/shape) — fail fast
     }
   }
-  logInfo(
-    `Agent ${opts.agentName}: done in ${((Date.now() - started) / 1000).toFixed(1)}s`
-  );
+  const seconds = (Date.now() - started) / 1000;
+  const usageStr = usage
+    ? `, ${formatTokens(usage.in)} in / ${formatTokens(usage.out)} out` +
+      (usage.out > 0 && seconds > 0 ? `, ${(usage.out / seconds).toFixed(1)} tok/s` : "")
+    : "";
+  logInfo(`Agent ${opts.agentName}: done in ${seconds.toFixed(1)}s${usageStr}`);
   logDebug(
     `Agent ${opts.agentName}: ${rp.protocol} ${rp.baseUrl}${rp.endpointPath} model=${opts.provider.model} ` +
       `headers=${JSON.stringify(redactHeaders(rp.headers))} ` +
@@ -364,7 +398,7 @@ export async function runAgent(opts: {
     logWarning(
       `Agent ${opts.agentName}: could not parse findings JSON; raw head: ${raw.slice(0, 300)}`
     );
-    return [];
+    return { findings: [], usage, seconds };
   }
   try {
     const out: Finding[] = [];
@@ -383,13 +417,13 @@ export async function runAgent(opts: {
         provider: opts.providerName,
       });
     }
-    return out;
+    return { findings: out, usage, seconds };
   } catch (e) {
     // Validation of individual findings failed — warn, don't silently drop everything.
     logWarning(
       `Agent ${opts.agentName}: findings validation failed (${(e as Error).message}); raw head: ${raw.slice(0, 200)}`
     );
-    return [];
+    return { findings: [], usage, seconds };
   }
 }
 
