@@ -39,7 +39,10 @@ function enabled(at: LogLevel): boolean {
 }
 
 export function logDebug(message: string): void {
-  if (enabled("debug")) core.debug(message);
+  // NOTE: core.debug() only prints with ACTIONS_STEP_DEBUG enabled, which
+  // would make log-level: debug a no-op for most users. Emit as info with a
+  // prefix instead so the input works standalone.
+  if (enabled("debug")) core.info(`[debug] ${message}`);
 }
 
 export function logInfo(message: string): void {
@@ -58,13 +61,20 @@ export function redactHeaders(headers: Record<string, string>): Record<string, s
   const out: Record<string, string> = {};
   for (const [k, v] of Object.entries(headers)) {
     const low = k.toLowerCase();
-    // Never print key material: scheme prefix only (e.g. "Bearer"), never the key.
-    out[k] =
-      low === "authorization" || low === "x-api-key" || low === "api-key"
-        ? v
-          ? v.replace(/\S+$/, "***")
-          : "(not set)"
-        : v;
+    // Never print key material. Auth headers keep only the scheme word
+    // ("Bearer ***"); everything else in the value is masked, since custom
+    // headers could carry multi-token secrets ("Bearer abc extra" must not
+    // leak "abc"). Non-auth headers print as-is (user's own config).
+    if (low === "authorization" || low === "x-api-key" || low === "api-key") {
+      if (!v) {
+        out[k] = "(not set)";
+      } else {
+        const space = v.indexOf(" ");
+        out[k] = space > 0 ? `${v.slice(0, space)} ***` : "***";
+      }
+    } else {
+      out[k] = v;
+    }
   }
   return out;
 }

@@ -44624,8 +44624,11 @@ function enabled(at) {
     return ORDER[at] >= ORDER[level];
 }
 function logDebug(message) {
+    // NOTE: core.debug() only prints with ACTIONS_STEP_DEBUG enabled, which
+    // would make log-level: debug a no-op for most users. Emit as info with a
+    // prefix instead so the input works standalone.
     if (enabled("debug"))
-        core.debug(message);
+        core.info(`[debug] ${message}`);
 }
 function logInfo(message) {
     if (enabled("info"))
@@ -44642,13 +44645,22 @@ function redactHeaders(headers) {
     const out = {};
     for (const [k, v] of Object.entries(headers)) {
         const low = k.toLowerCase();
-        // Never print key material: scheme prefix only (e.g. "Bearer"), never the key.
-        out[k] =
-            low === "authorization" || low === "x-api-key" || low === "api-key"
-                ? v
-                    ? v.replace(/\S+$/, "***")
-                    : "(not set)"
-                : v;
+        // Never print key material. Auth headers keep only the scheme word
+        // ("Bearer ***"); everything else in the value is masked, since custom
+        // headers could carry multi-token secrets ("Bearer abc extra" must not
+        // leak "abc"). Non-auth headers print as-is (user's own config).
+        if (low === "authorization" || low === "x-api-key" || low === "api-key") {
+            if (!v) {
+                out[k] = "(not set)";
+            }
+            else {
+                const space = v.indexOf(" ");
+                out[k] = space > 0 ? `${v.slice(0, space)} ***` : "***";
+            }
+        }
+        else {
+            out[k] = v;
+        }
     }
     return out;
 }
@@ -45216,11 +45228,21 @@ function runningActionVersion(env) {
 
 ;// CONCATENATED MODULE: ./dist-src/github.js
 const STICKY_MARKER = "<!-- openreview:sticky -->";
-const LOGO_URL = "https://raw.githubusercontent.com/sankara-sabapathy/openreview/v1/assets/logo.svg";
+function actionBase() {
+    // Prefer the action's own coordinates so forks/renames keep working; the
+    // hardcoded default matches this repo's published location.
+    const repo = process.env.GITHUB_ACTION_REPOSITORY || "sankara-sabapathy/openreview";
+    const ref = process.env.GITHUB_ACTION_REF || "v1";
+    return { repo, ref };
+}
+function logoUrl() {
+    const { repo, ref } = actionBase();
+    return `https://raw.githubusercontent.com/${repo}/${ref}/assets/logo.svg`;
+}
 function renderStickyBody(opts) {
     const lines = [];
     lines.push(STICKY_MARKER);
-    lines.push(`<img src="${LOGO_URL}" width="28" height="28" align="left" alt="OpenReview AI" />`);
+    lines.push(`<img src="${logoUrl()}" width="28" height="28" align="left" alt="OpenReview AI" />`);
     lines.push(`## OpenReview AI — ${opts.verdict.replace(/_/g, " ").toUpperCase()}`);
     lines.push("");
     lines.push("<br />");
@@ -45267,7 +45289,7 @@ async function createInlineReview(octokit, owner, repo, pullNumber, commitSha, v
         .map((f) => ({ path: f.file, line: f.line, body: f.comment }));
     await octokit.rest.pulls.createReview({
         owner, repo, pull_number: pullNumber, commit_id: commitSha, event: event,
-        body: `<img src="${LOGO_URL}" width="20" height="20" alt="OpenReview AI" /> **OpenReview AI:** ${verdict} (${findings.length} findings)`,
+        body: `<img src="${logoUrl()}" width="20" height="20" alt="OpenReview AI" /> **OpenReview AI:** ${verdict} (${findings.length} findings)`,
         comments: comments,
     });
 }

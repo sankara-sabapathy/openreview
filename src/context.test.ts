@@ -153,11 +153,25 @@ describe("logger", () => {
     const out = redactHeaders({
       authorization: "Bearer sk-ant-secret",
       "x-api-key": "sk-ant-secret",
+      "X-Api-Key": "other-secret",
+      "api-key": "azure-secret",
       "content-type": "application/json",
     });
     assert.equal(out["authorization"], "Bearer ***");
     assert.equal(out["x-api-key"], "***");
+    assert.equal(out["X-Api-Key"], "***");
+    assert.equal(out["api-key"], "***");
     assert.equal(out["content-type"], "application/json");
-    assert.ok(!JSON.stringify(out).includes("sk-ant-secret"));
+    assert.ok(!JSON.stringify(out).includes("secret"));
+  });
+  it("masks every token in multi-token values", async () => {
+    const { redactHeaders } = await import("./logger.js");
+    const out = redactHeaders({ authorization: "Bearer abc123 extra" });
+    assert.equal(out["authorization"], "Bearer ***");
+    assert.ok(!out["authorization"].includes("abc123"));
+  });
+  it("marks unset keys", async () => {
+    const { redactHeaders } = await import("./logger.js");
+    assert.equal(redactHeaders({ authorization: "" })["authorization"], "(not set)");
   });
 });
