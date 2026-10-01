@@ -44551,6 +44551,10 @@ const ReviewConfig = objectType({
     include_full_files: booleanType().optional(),
     // Per-review context budget override (defaults to defaults.max_context_chars).
     max_context_chars: numberType().int().nonnegative().optional(),
+    // Noise controls (issue #21): profile preset + explicit overrides (win).
+    profile: enumType(["quiet", "balanced", "assertive"]).optional(),
+    min_confidence: numberType().min(0).max(1).optional(),
+    max_findings: numberType().int().positive().optional(),
     main: AgentConfig,
     subagents: arrayType(AgentConfig).default([]),
     verdict: VerdictConfig.default({}),
@@ -44573,6 +44577,10 @@ const OpenReviewConfig = objectType({
         max_diff_chars: numberType().int().positive().default(80000),
         max_context_chars: numberType().int().nonnegative().default(20000),
         include_full_files: booleanType().default(true),
+        // Noise defaults (issue #21). Severity stays owned by verdict.min_severity.
+        profile: enumType(["quiet", "balanced", "assertive"]).default("balanced"),
+        min_confidence: numberType().min(0).max(1).optional(),
+        max_findings: numberType().int().positive().optional(),
     })
         .default({}),
     providers: recordType(stringType(), ProviderConfig),
@@ -45197,6 +45205,28 @@ function dedupeFindings(findings) {
         out.push(f);
     }
     return out;
+}
+// Presets for noise control. balanced ≈ historical behavior (no effective
+// filtering: floor 0, cap above the display limits). Severity stays owned by
+// verdict.min_severity; profiles only add confidence + cap.
+const NOISE_PRESETS = {
+    quiet: { min_confidence: 0.85, max_findings: 3 },
+    balanced: { min_confidence: 0, max_findings: 50 },
+    assertive: { min_confidence: 0, max_findings: 100 },
+};
+function resolveNoise(opts) {
+    const preset = NOISE_PRESETS[opts.profile ?? "balanced"];
+    return {
+        min_confidence: opts.min_confidence ?? preset.min_confidence,
+        max_findings: opts.max_findings ?? preset.max_findings,
+    };
+}
+function applyNoiseControls(findings, settings) {
+    const kept = findings.filter((f) => (f.confidence ?? 0.7) >= settings.min_confidence);
+    const rank = { high: 0, medium: 1, suggestion: 2 };
+    kept.sort((a, b) => rank[a.severity] - rank[b.severity] || (b.confidence ?? 0.7) - (a.confidence ?? 0.7));
+    const visible = kept.slice(0, Math.max(1, settings.max_findings));
+    return { visible, dropped: findings.length - visible.length };
 }
 function decideReviewVerdict(mode, minSeverity, findings) {
     const rank = { suggestion: 0, medium: 1, high: 2 };
@@ -45867,6 +45897,18 @@ async function run() {
             const agentErrors = results.filter((r) => r.error).map((r) => `- \`${r.agent}\`: ${r.error}`);
             if (review.verdict.deduplicate)
                 findings = dedupeFindings(findings);
+            // Noise controls (issue #21): confidence floor + cap, then verdict on survivors.
+            const noise = resolveNoise({
+                profile: review.profile ?? config.defaults.profile,
+                min_confidence: review.min_confidence ?? config.defaults.min_confidence,
+                max_findings: review.max_findings ?? config.defaults.max_findings,
+            });
+            const preNoise = findings.length;
+            findings = applyNoiseControls(findings, noise).visible;
+            if (findings.length < preNoise) {
+                logInfo(`Review ${review.id}: noise controls dropped ${preNoise - findings.length} finding(s) ` +
+                    `(profile=${review.profile ?? config.defaults.profile}, min_confidence=${noise.min_confidence}, max_findings=${noise.max_findings})`);
+            }
             findings.sort((a, b) => ({ high: 0, medium: 1, suggestion: 2 }[a.severity] -
                 { high: 0, medium: 1, suggestion: 2 }[b.severity]));
             const verdict = (() => {

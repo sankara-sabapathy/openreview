@@ -81,6 +81,10 @@ export const ReviewConfig = z.object({
   include_full_files: z.boolean().optional(),
   // Per-review context budget override (defaults to defaults.max_context_chars).
   max_context_chars: z.number().int().nonnegative().optional(),
+  // Noise controls (issue #21): profile preset + explicit overrides (win).
+  profile: z.enum(["quiet", "balanced", "assertive"]).optional(),
+  min_confidence: z.number().min(0).max(1).optional(),
+  max_findings: z.number().int().positive().optional(),
   main: AgentConfig,
   subagents: z.array(AgentConfig).default([]),
   verdict: VerdictConfig.default({}),
@@ -106,6 +110,10 @@ export const OpenReviewConfig = z.object({
       max_diff_chars: z.number().int().positive().default(80000),
       max_context_chars: z.number().int().nonnegative().default(20000),
       include_full_files: z.boolean().default(true),
+      // Noise defaults (issue #21). Severity stays owned by verdict.min_severity.
+      profile: z.enum(["quiet", "balanced", "assertive"]).default("balanced"),
+      min_confidence: z.number().min(0).max(1).optional(),
+      max_findings: z.number().int().positive().optional(),
     })
     .default({}),
   providers: z.record(z.string(), ProviderConfig),

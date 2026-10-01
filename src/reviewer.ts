@@ -41,6 +41,47 @@ export function dedupeFindings<T extends { file: string; line?: number; comment:
 
 export type Verdict = "approve" | "comment" | "request_changes";
 
+export type NoiseProfile = "quiet" | "balanced" | "assertive";
+
+// Presets for noise control. balanced ≈ historical behavior (no effective
+// filtering: floor 0, cap above the display limits). Severity stays owned by
+// verdict.min_severity; profiles only add confidence + cap.
+export const NOISE_PRESETS: Record<NoiseProfile, { min_confidence: number; max_findings: number }> = {
+  quiet: { min_confidence: 0.85, max_findings: 3 },
+  balanced: { min_confidence: 0, max_findings: 50 },
+  assertive: { min_confidence: 0, max_findings: 100 },
+};
+
+export type NoiseSettings = {
+  min_confidence: number;
+  max_findings: number;
+};
+
+export function resolveNoise(opts: {
+  profile?: NoiseProfile;
+  min_confidence?: number;
+  max_findings?: number;
+}): NoiseSettings {
+  const preset = NOISE_PRESETS[opts.profile ?? "balanced"];
+  return {
+    min_confidence: opts.min_confidence ?? preset.min_confidence,
+    max_findings: opts.max_findings ?? preset.max_findings,
+  };
+}
+
+export function applyNoiseControls<T extends { confidence: number; severity: string }>(
+  findings: T[],
+  settings: NoiseSettings
+): { visible: T[]; dropped: number } {
+  const kept = findings.filter((f) => (f.confidence ?? 0.7) >= settings.min_confidence);
+  const rank: Record<string, number> = { high: 0, medium: 1, suggestion: 2 };
+  kept.sort(
+    (a, b) => rank[a.severity] - rank[b.severity] || (b.confidence ?? 0.7) - (a.confidence ?? 0.7)
+  );
+  const visible = kept.slice(0, Math.max(1, settings.max_findings));
+  return { visible, dropped: findings.length - visible.length };
+}
+
 export function decideReviewVerdict(
   mode: Verdict,
   minSeverity: "suggestion" | "medium" | "high",

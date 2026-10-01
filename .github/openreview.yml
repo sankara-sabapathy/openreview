@@ -78,6 +78,12 @@ reviews:
   - id: general-quality
     if_paths: ["**"]
     strategy: any # any | all | majority: per-provider ballots; see website/docs/multi-review
+    # Noise controls (issue #21): profile preset + explicit overrides (win).
+    # quiet: high-confidence top-3 · balanced (default): passthrough ·
+    # assertive: everything up to 100.
+    # profile: balanced
+    # min_confidence: 0.6
+    # max_findings: 10
     # Cross-file context: full changed files + call-site excerpts automatic
     # (bounded by max_context_chars below); add explicit files when needed:
     # context_files: ["src/config.ts"]

@@ -8,7 +8,7 @@ import { templateContextFor, resolveExtends, mergeConfigs, parseConfigLoose } fr
 import { resolveKeysFromEnv, runAgent, formatTokens, type Finding } from "./providers.js";
 import {
   matchesAny, filterIgnored, dedupeFindings,
-  decideReviewVerdict, combineVerdicts, combineBallots, type Verdict,
+  decideReviewVerdict, combineVerdicts, combineBallots, resolveNoise, applyNoiseControls, type Verdict,
   satisfiesActionVersion, runningActionVersion,
 } from "./reviewer.js";
 import { renderStickyBody, upsertStickyComment, createInlineReview } from "./github.js";
@@ -193,6 +193,20 @@ export async function run(): Promise<void> {
       let findings = results.flatMap((r) => r.findings);
       const agentErrors = results.filter((r) => r.error).map((r) => `- \`${r.agent}\`: ${r.error}`);
       if (review.verdict.deduplicate) findings = dedupeFindings(findings);
+      // Noise controls (issue #21): confidence floor + cap, then verdict on survivors.
+      const noise = resolveNoise({
+        profile: review.profile ?? config.defaults.profile,
+        min_confidence: review.min_confidence ?? config.defaults.min_confidence,
+        max_findings: review.max_findings ?? config.defaults.max_findings,
+      });
+      const preNoise = findings.length;
+      findings = applyNoiseControls(findings, noise).visible;
+      if (findings.length < preNoise) {
+        logInfo(
+          `Review ${review.id}: noise controls dropped ${preNoise - findings.length} finding(s) ` +
+            `(profile=${review.profile ?? config.defaults.profile}, min_confidence=${noise.min_confidence}, max_findings=${noise.max_findings})`
+        );
+      }
       findings.sort((a, b) =>
         ({ high: 0, medium: 1, suggestion: 2 } as const)[a.severity] -
         ({ high: 0, medium: 1, suggestion: 2 } as const)[b.severity]
