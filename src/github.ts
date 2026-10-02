@@ -11,7 +11,15 @@ function actionBase(): { repo: string; ref: string } {
   // checkout ref — `refs/pull/62/merge` — which raw.githubusercontent cannot
   // serve, so the logo would 404 in every comment. Prefer the PR's head branch,
   // then any plain branch/tag, and fall back to the default branch.
-  const head = process.env.GITHUB_HEAD_REF || "";
+  //
+  // Only trust GITHUB_HEAD_REF when the head branch actually lives in THIS
+  // repo: on a fork PR it does not, and {base}/{head}/assets 404s — the exact
+  // failure this function exists to prevent.
+  const headRepo = (github.context?.payload as any)?.pull_request?.head?.repo?.full_name;
+  const head =
+    typeof headRepo === "string" && headRepo.toLowerCase() === repo.toLowerCase()
+      ? process.env.GITHUB_HEAD_REF || ""
+      : "";
   if (head && !head.includes("..") && !/[~^:\\]|\s/.test(head)) return { repo, ref: head };
   if (/^[\w.\-/]+$/.test(ref) && !ref.startsWith("refs/")) return { repo, ref };
   return { repo, ref: "main" };

@@ -447,12 +447,9 @@ export async function runAgent(opts: {
   // Per-attempt timeout bounds hung gateway connections (the 9-minute run was
   // a single fetch hanging ~5 min with no timeout).
   const maxAttempts = 1 + Math.min(Math.max(opts.provider.retries ?? 2, 0), 5);
-  // Per-attempt cap, never exceeding what is left of the run's budget (#51).
+  // Per-attempt cap; recomputed per attempt below so it can only shrink as
+  // the run's deadline approaches (issue #51).
   const perAttempt = (opts.provider.timeout_s ?? 420) * 1000;
-  const timeoutMs =
-    opts.deadlineAt === undefined
-      ? perAttempt
-      : Math.max(1_000, Math.min(perAttempt, opts.deadlineAt - Date.now()));
   const started = Date.now();
   let raw = "";
   let usage: Usage = null;
@@ -461,7 +458,20 @@ export async function runAgent(opts: {
   // answering in a field we don't read), so a third attempt just triples the
   // wall-clock cost. Allow one retry, not `retries` (issue #51).
   let emptyRetries = 0;
+  let attemptsMade = 0;
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    // Re-check the budget before EVERY attempt. A retry is a new HTTP call: it
+    // must not start once the run budget is gone, or the run overruns
+    // max_runtime_s by up to maxAttempts x timeout_s.
+    if (opts.deadlineAt !== undefined && Date.now() >= opts.deadlineAt) {
+      logWarning(`Agent ${opts.agentName}: run budget exhausted before attempt ${attempt}.`);
+      break;
+    }
+    attemptsMade = attempt;
+    const timeoutMs =
+      opts.deadlineAt === undefined
+        ? perAttempt
+        : Math.max(1_000, Math.min(perAttempt, opts.deadlineAt - Date.now()));
     try {
       let out;
       if (rp.protocol === "anthropic-messages") {
@@ -506,10 +516,19 @@ export async function runAgent(opts: {
         if (emptyRetries >= 1) break; // deterministic: one retry is enough
         emptyRetries++;
       }
+      // Don't sleep past the budget: the next iteration re-checks it anyway.
+      const backoffMs =
+        opts.deadlineAt === undefined
+          ? 2000 * attempt
+          : Math.max(0, Math.min(2000 * attempt, opts.deadlineAt - Date.now()));
+      if (opts.deadlineAt !== undefined && Date.now() + backoffMs >= opts.deadlineAt) {
+        logWarning(`Agent ${opts.agentName}: no time left for a retry after attempt ${attempt}.`);
+        break;
+      }
       logWarning(
         `Agent ${opts.agentName}: attempt ${attempt}/${maxAttempts} failed (${lastError.slice(0, 160)}); retrying`
       );
-      await sleep(2000 * attempt);
+      await sleep(backoffMs);
     } else if (attempt < maxAttempts) {
       break; // non-retryable (auth/shape) — fail fast
     }
@@ -527,7 +546,9 @@ export async function runAgent(opts: {
   );
   if (!raw.trim()) {
     // Total failure surfaces into the PR's agent-error block (main.ts catch).
-    throw new Error(`Agent ${opts.agentName} failed after ${maxAttempts} attempt(s): ${lastError}`);
+    throw new Error(
+      `Agent ${opts.agentName} failed after ${attemptsMade} attempt(s): ${lastError || "run budget exhausted"}`
+    );
   }
   const parsed = extractFindingsJson(raw);
   if (!parsed) {
@@ -572,18 +593,36 @@ export function extractFindingsJson(raw: string): { findings?: any[] } | null {
   const cleaned = raw.replace(/^```(?:json)?\s*/i, "").replace(/```$/i, "").trim();
   // 1. The whole thing is usually the JSON.
   const direct = tryParse(cleaned);
-  if (direct && Array.isArray(direct.findings)) return direct;
+  const directFindings = pickFindings(direct);
+  if (directFindings) return { findings: directFindings };
   // 2. Scan balanced objects left to right and take the first that really
   //    carries a findings array. Lazy on purpose: a 130k-token reasoning trace
   //    holds thousands of `{...}` fragments from quoted code, and materializing
   //    them all (let alone parsing each) is what made this fail on a live run.
   for (const cand of balancedObjects(cleaned)) {
     if (!cand.includes("findings")) continue; // cheap pre-filter
-    const parsed = tryParse(cand);
-    if (parsed && Array.isArray(parsed.findings)) return parsed;
+    const found = pickFindings(tryParse(cand));
+    if (found) return { findings: found };
   }
   // 3. Tolerate a differently-shaped object rather than losing the response.
   return direct;
+}
+
+/** A model's answer is not always `{"findings": [...]}` at the top level — it
+ * can be `{"analysis": "...", "result": {"findings": [...]}}`. Look a couple of
+ * levels down before giving up, so we don't skip past the outer balanced
+ * object and never reach the nested array. */
+function pickFindings(o: unknown, depth = 3): any[] | null {
+  if (!o || typeof o !== "object") return null;
+  if (Array.isArray((o as any).findings)) return (o as any).findings;
+  if (depth <= 0) return null;
+  for (const v of Object.values(o as Record<string, unknown>)) {
+    if (v && typeof v === "object") {
+      const found = pickFindings(v, depth - 1);
+      if (found) return found;
+    }
+  }
+  return null;
 }
 
 function tryParse(s: string): { findings?: any[] } | null {
@@ -595,8 +634,13 @@ function tryParse(s: string): { findings?: any[] } | null {
   }
 }
 
-/** Yield each balanced `{...}` region, left to right, bounded. */
-function* balancedObjects(s: string, maxScan = 400_000): Generator<string> {
+/** Yield each balanced `{...}` region, left to right, bounded.
+ * The cap is deliberately generous: the motivating case was a 131k-token
+ * reasoning trace (~500k chars) with the answer at the very end, so a cap
+ * below that reintroduces the exact failure this replaces. The scan is lazy and
+ * exits on the first `findings` object, so a large bound costs nothing in the
+ * common case. */
+function* balancedObjects(s: string, maxScan = 4_000_000): Generator<string> {
   const limit = Math.min(s.length, maxScan);
   let i = 0;
   while (i < limit) {

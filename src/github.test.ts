@@ -106,7 +106,9 @@ describe("renderStickyBody (issue #46)", () => {
 describe("countsAsReview", () => {
   it("only ok / no-findings may vote", () => {
     const voting: AgentOutcome[] = ["ok", "no-findings"];
-    const nonVoting: AgentOutcome[] = ["skipped-no-key", "unparseable", "error"];
+    // budget-exhausted must be here too: the dogfood review on #63 flagged that
+  // it was missing from this list (it was already excluded by the function).
+  const nonVoting: AgentOutcome[] = ["skipped-no-key", "budget-exhausted", "unparseable", "error"];
     for (const o of voting) assert.equal(countsAsReview(o), true, `${o} should vote`);
     for (const o of nonVoting) assert.equal(countsAsReview(o), false, `${o} must not vote`);
   });

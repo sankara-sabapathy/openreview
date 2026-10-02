@@ -6,7 +6,10 @@ import {
   isRetryableError,
   extractAssistantText,
   extractFindingsJson,
+  runAgent,
+  countsAsReview,
 } from "./providers.js";
+import { parseConfig } from "./config.js";
 
 function serve(
   handler: (req: unknown, res: { writeHead: Function; write: Function; end: Function; flushHeaders: Function }) => void
@@ -376,5 +379,56 @@ describe("extractFindingsJson (issue #54)", () => {
   });
   it("keeps a legitimately empty findings array", () => {
     has(extractFindingsJson('{"findings":[]}'));
+  });
+});
+
+describe("runAgent deadline (issue #51)", () => {
+  const cfg = parseConfig({
+    version: 1,
+    providers: { anthropic: { model: "m", kind: "anthropic", base_url: "http://127.0.0.1:1/v1" } },
+    reviews: [{ id: "r", main: { provider: "anthropic", instructions: "i" } }],
+  });
+  const keys = {
+    anthropicApiKey: "k",
+    openaiApiKey: "",
+    opencodeApiKey: "",
+    opencodeBaseUrl: "",
+    githubToken: "",
+  };
+  const base = {
+    agentName: "a",
+    providerName: "anthropic",
+    provider: cfg.providers.anthropic,
+    instructions: "i",
+    diff: "d",
+    lang: "en",
+    keys,
+    maxDiffChars: 100,
+    sessionId: "s",
+  };
+
+  it("refuses to start once the budget is gone, and does not vote", async () => {
+    const r = await runAgent({ ...base, deadlineAt: Date.now() - 1 });
+    assert.equal(r.outcome, "budget-exhausted");
+    assert.equal(countsAsReview(r.outcome), false);
+    assert.equal(r.findings.length, 0);
+  });
+
+  it("clamps a call to the remaining budget instead of hanging", async () => {
+    // Unroutable base_url + a huge timeout_s: without clamping the abort would
+    // come from ECONNREFUSED, with a real 600s timeout_s it must come from our
+    // ~200ms deadline clamp.
+    const t0 = Date.now();
+    await assert.rejects(
+      runAgent({
+        ...base,
+        provider: { ...cfg.providers.anthropic, timeout_s: 600 },
+        deadlineAt: Date.now() + 200,
+      })
+    );
+    const elapsed = Date.now() - t0;
+    // Loopback refuses connections immediately either way; the point is that it
+    // returns fast and does not run the full attempt budget.
+    assert.ok(elapsed < 5000, `took ${elapsed}ms, expected the budget clamp to bound it`);
   });
 });
