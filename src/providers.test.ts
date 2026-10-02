@@ -1,7 +1,12 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
-import { readBodyWithIdleTimeout, isRetryableError, extractAssistantText } from "./providers.js";
+import {
+  readBodyWithIdleTimeout,
+  isRetryableError,
+  extractAssistantText,
+  extractFindingsJson,
+} from "./providers.js";
 
 function serve(
   handler: (req: unknown, res: { writeHead: Function; write: Function; end: Function; flushHeaders: Function }) => void
@@ -290,12 +295,15 @@ describe("extractAssistantText (issue #26)", () => {
       '{"findings":[{"file":"a.ts"}]}'
     );
   });
-  it("concatenates both, content last so the answer wins", () => {
+  it("does NOT concatenate: content alone wins when present", () => {
+    // Concatenating fed the whole thinking trace to extractFindingsJson and lost
+    // two complete reviews on a live run (see "prefers content over the
+    // reasoning trace" below and the extractFindingsJson regressions).
     assert.equal(
       extractAssistantText({
         choices: [{ message: { reasoning_content: "thinking", content: "answer" } }],
       }),
-      "thinking\nanswer"
+      "answer"
     );
   });
   it("ignores blank/whitespace-only fields", () => {
@@ -314,5 +322,59 @@ describe("extractAssistantText (issue #26)", () => {
     // It must be "" so runAgent's "empty content" path (and its 1-retry cap)
     // still works, rather than a plausible-looking empty review.
     assert.equal(extractAssistantText({ choices: [{ message: { content: null } }] }), "");
+  });
+  it("prefers content over the reasoning trace (live regression)", () => {
+    // Concatenating both fed 131k tokens of thinking into the JSON extractor and
+    // lost two complete reviews. content wins whenever it has anything.
+    assert.equal(
+      extractAssistantText({
+        choices: [{ message: { reasoning_content: "x".repeat(100000), content: "ANSWER" } }],
+      }),
+      "ANSWER"
+    );
+  });
+});
+
+describe("extractFindingsJson (issue #54)", () => {
+  const J = '{"findings":[{"file":"a.ts","line":1,"severity":"high","comment":"x","confidence":0.9}]}';
+  const ok = (r: unknown) => assert.ok(r, "expected findings to be extracted");
+  const has = (r: { findings?: unknown[] } | null) => assert.ok(Array.isArray(r?.findings));
+
+  it("parses bare and fenced JSON", () => {
+    ok(extractFindingsJson(J));
+    has(extractFindingsJson("```json\n" + J + "\n```"));
+  });
+  it("survives prose after the JSON (the old greedy match died here)", () => {
+    ok(extractFindingsJson("Here you go: " + J + " Let me know if you need more."));
+  });
+  it("survives braces in prose before the JSON", () => {
+    ok(extractFindingsJson("Note {see below} -> " + J));
+  });
+  it("picks the object that actually has findings", () => {
+    ok(extractFindingsJson('{"a":1} then ' + J));
+    ok(extractFindingsJson(J + ' then {"a":1}'));
+  });
+  it("recovers from a stray closing brace and an unclosed opening brace", () => {
+    ok(extractFindingsJson("}}} oops " + J));
+    ok(extractFindingsJson("foo { bar " + J));
+  });
+  it("handles braces and escaped quotes inside string values", () => {
+    has(extractFindingsJson('{"findings":[{"comment":"use {x} and \\"q\\" here"}]}'));
+  });
+  it("recovers a valid review glued to a 130k-token reasoning trace", () => {
+    // The live failure: a thinking monologue quoting code, then the answer.
+    const mono =
+      "The changed function foo(x) returns {a: 1} so I check if (x) { return {b:2} } instead. ".repeat(1500);
+    const r = extractFindingsJson(mono + J + " That is the only issue.");
+    has(r);
+    assert.equal(r?.findings?.length, 1);
+  });
+  it("returns null when there is genuinely no JSON", () => {
+    assert.equal(extractFindingsJson("no json at all"), null);
+    assert.equal(extractFindingsJson("the code is if (x) { return 1 } ok"), null);
+    assert.equal(extractFindingsJson(""), null);
+  });
+  it("keeps a legitimately empty findings array", () => {
+    has(extractFindingsJson('{"findings":[]}'));
   });
 });

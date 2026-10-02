@@ -45000,16 +45000,23 @@ async function callAnthropic(opts) {
     }
 }
 /** Extract the assistant text from an openai-chat response (issue #26).
- * Reasoning models (DeepSeek V4 flash, GLM, etc.) answer in
+ * Reasoning models (DeepSeek V4 flash, GLM, …) answer in
  * `message.reasoning_content` and leave `message.content` empty, so reading
- * `content` alone produced an empty string — and `??` never fires on `""` —
- * which looked like a provider failure and was retried 3x for nothing.
- * Concatenate both, content last so the final answer wins any brace-matching. */
+ * `content` alone produced "" — and `??` never fires on an empty string — which
+ * looked like a provider failure and was retried 3x for nothing.
+ *
+ * PREFER `content`, and only fall back to the reasoning fields. Do NOT
+ * concatenate them: `reasoning_content` is the model's whole thinking trace
+ * (131k tokens observed on a live run), and prepending it to the answer makes
+ * `extractFindingsJson`'s brace-matching span the entire monologue, so a
+ * perfectly good review fails to parse. */
 function extractAssistantText(j) {
     const msg = j?.choices?.[0]?.message ?? {};
-    const parts = [msg.reasoning_content, msg.reasoning, msg.content]
-        .filter((p) => typeof p === "string" && p.trim().length > 0);
-    return parts.join("\n");
+    if (typeof msg.content === "string" && msg.content.trim())
+        return msg.content;
+    return [msg.reasoning_content, msg.reasoning]
+        .filter((p) => typeof p === "string" && p.trim().length > 0)
+        .join("\n");
 }
 async function callOpenAICompatible(opts) {
     const base = opts.baseUrl.replace(/\/$/, "");
@@ -45263,24 +45270,92 @@ async function runAgent(opts) {
         return { findings: [], usage, seconds, outcome: "unparseable" };
     }
 }
-// Parse the findings JSON out of a model response. Tries strict parse first,
-// then falls back to the largest {...} substring (models often wrap JSON in
-// prose when response_format is ignored). Returns null on total failure.
+// Parse the findings JSON out of a model response. A strict parse first, then
+// a balanced-brace scan for the first object that parses AND carries a
+// `findings` key (issue #54). The old fallback was a GREEDY `/\{[\s\S]*\}/`,
+// which breaks the moment prose with braces follows the JSON — a live run lost
+// two complete reviews (131k reasoning tokens) to exactly that.
 function extractFindingsJson(raw) {
     const cleaned = raw.replace(/^```(?:json)?\s*/i, "").replace(/```$/i, "").trim();
-    const candidates = [cleaned];
-    const greedy = cleaned.match(/\{[\s\S]*\}/);
-    if (greedy && greedy[0] !== cleaned)
-        candidates.push(greedy[0]);
-    for (const c of candidates) {
-        try {
-            return JSON.parse(c);
-        }
-        catch {
-            // try next candidate
-        }
+    // 1. The whole thing is usually the JSON.
+    const direct = tryParse(cleaned);
+    if (direct && Array.isArray(direct.findings))
+        return direct;
+    // 2. Scan balanced objects left to right and take the first that really
+    //    carries a findings array. Lazy on purpose: a 130k-token reasoning trace
+    //    holds thousands of `{...}` fragments from quoted code, and materializing
+    //    them all (let alone parsing each) is what made this fail on a live run.
+    for (const cand of balancedObjects(cleaned)) {
+        if (!cand.includes("findings"))
+            continue; // cheap pre-filter
+        const parsed = tryParse(cand);
+        if (parsed && Array.isArray(parsed.findings))
+            return parsed;
     }
-    return null;
+    // 3. Tolerate a differently-shaped object rather than losing the response.
+    return direct;
+}
+function tryParse(s) {
+    try {
+        const p = JSON.parse(s);
+        return p && typeof p === "object" ? p : null;
+    }
+    catch {
+        return null;
+    }
+}
+/** Yield each balanced `{...}` region, left to right, bounded. */
+function* balancedObjects(s, maxScan = 400_000) {
+    const limit = Math.min(s.length, maxScan);
+    let i = 0;
+    while (i < limit) {
+        if (s[i] !== "{") {
+            i++;
+            continue;
+        }
+        let depth = 0;
+        let inStr = false;
+        let esc = false;
+        let end = -1;
+        for (let j = i; j < limit; j++) {
+            const ch = s[j];
+            if (esc) {
+                esc = false;
+                continue;
+            }
+            if (ch === "\\") {
+                esc = true;
+                continue;
+            }
+            if (ch === '"') {
+                inStr = !inStr;
+                continue;
+            }
+            if (inStr)
+                continue;
+            if (ch === "{")
+                depth++;
+            else if (ch === "}") {
+                // A stray '}' in prose must not drive the depth negative, or every
+                // later brace is miscounted and the real object is never found.
+                if (depth === 0)
+                    continue;
+                depth--;
+                if (depth === 0) {
+                    end = j;
+                    break;
+                }
+            }
+        }
+        if (end === -1) {
+            // Unclosed '{' (truncated prose): resume after it rather than giving up,
+            // otherwise the actual findings object further along is never reached.
+            i++;
+            continue;
+        }
+        yield s.slice(i, end + 1);
+        i = end + 1; // nested objects are inside the candidate we just yielded
+    }
 }
 
 ;// CONCATENATED MODULE: ./dist-src/reviewer.js
