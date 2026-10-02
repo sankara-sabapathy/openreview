@@ -5,14 +5,20 @@ import { readBodyWithIdleTimeout, isRetryableError } from "./providers.js";
 
 function serve(
   handler: (req: unknown, res: { writeHead: Function; write: Function; end: Function; flushHeaders: Function }) => void
-): Promise<{ url: string; close: () => void }> {
+): Promise<{ url: string; close: () => void; openSockets: () => number }> {
   return new Promise((resolve) => {
     const server = createServer(handler as never);
+    let open = 0;
+    server.on("connection", (s) => {
+      open++;
+      s.on("close", () => open--);
+    });
     server.listen(0, "127.0.0.1", () => {
       const addr = server.address();
       const port = typeof addr === "object" && addr ? addr.port : 0;
       resolve({
         url: `http://127.0.0.1:${port}/`,
+        openSockets: () => open,
         close: () => {
           // Destroy open sockets first: idle/trickle tests leave connections
           // hanging by design, and close() alone waits for them forever.
@@ -84,6 +90,94 @@ describe("readBodyWithIdleTimeout", () => {
     }
   });
 
+  it("keeps a small but COMPLETE response (early-flushed headers)", async () => {
+    // Regression: a gateway that flushes headers early (proxy/LB/`stream: true`)
+    // makes the throughput guard run on the first — and only — chunk, so a
+    // small valid payload tripped it and the whole agent died. {"findings":[]}
+    // is 16 bytes, so the empty-result path was the worst case. Completion must
+    // win: the body is delivered at 700ms (past the 600ms window, well inside
+    // the 900ms idle timer) and must survive.
+    const body = JSON.stringify({
+      findings: [
+        {
+          file: "src/a.ts",
+          line: 12,
+          severity: "high",
+          category: "bug",
+          comment: "Unchecked null deref when opts is undefined.",
+          confidence: 0.9,
+        },
+      ],
+    });
+    assert.ok(body.length < 1024, "fixture must be under the throughput threshold");
+    const { url, close } = await serve((_req, res) => {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.flushHeaders();
+      setTimeout(() => {
+        try {
+          res.end(body);
+        } catch {
+          // ignore
+        }
+      }, 700);
+    });
+    try {
+      const text = await readBodyWithIdleTimeout(
+        await fetch(url, { headers: { connection: "close" } }),
+        900,
+        "t",
+        600,
+        1024
+      );
+      assert.equal(text, body);
+    } finally {
+      close();
+    }
+  });
+
+  it("releases the socket when the trickle guard fires", async () => {
+    // The trickle throw skips the idle watchdog's reader.cancel(), which used to
+    // hold the connection until the caller's total cap aborted it.
+    let open = 0;
+    const { url, close, openSockets } = await serve((_req, res) => {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.flushHeaders();
+      const timer = setInterval(() => {
+        try {
+          res.write("x");
+        } catch {
+          clearInterval(timer);
+        }
+      }, 100);
+      setTimeout(() => {
+        clearInterval(timer);
+        try {
+          res.end();
+        } catch {
+          // ignore
+        }
+      }, 5000).unref?.();
+    });
+    open = openSockets();
+    try {
+      await assert.rejects(
+        readBodyWithIdleTimeout(
+          await fetch(url, { headers: { connection: "close" } }),
+          3000,
+          "t",
+          500,
+          100000
+        ),
+        /trickle timeout/
+      );
+      // Give the cancel a beat to propagate to the server side.
+      await new Promise((r) => setTimeout(r, 250));
+      assert.equal(openSockets(), 0, "trickle path must release the socket");
+    } finally {
+      close();
+    }
+  });
+
   it("lets a slow-but-producing stream through", async () => {
     const { url, close } = await serve((_req, res) => {
       res.writeHead(200, { "content-type": "application/json" });
@@ -121,5 +215,24 @@ describe("isRetryableError", () => {
     assert.ok(isRetryableError("t: idle timeout (no bytes for 90s)"));
     assert.ok(isRetryableError("timeout after 420000ms"));
     assert.ok(!isRetryableError("llm https://x 401: invalid key"));
+  });
+  it("keeps the caller's AbortError from the total cap", async () => {
+    // The total-cap AbortController aborts mid-read, so reader.read() rejects
+    // with an AbortError. It must be rethrown untouched so the caller still maps
+    // it to "timeout after <n>ms" (and isRetryableError still retries it)
+    // instead of blaming the idle watchdog — the misleading report the review
+    // flagged. Injected via an errored stream to keep it deterministic.
+    const res = new Response(
+      new ReadableStream({
+        start(c) {
+          c.error(new DOMException("This operation was aborted", "AbortError"));
+        },
+      }),
+      { status: 200 }
+    );
+    await assert.rejects(readBodyWithIdleTimeout(res, 90000, "t"), (e: Error) => {
+      assert.equal(e.name, "AbortError");
+      return true;
+    });
   });
 });
