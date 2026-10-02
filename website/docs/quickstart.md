@@ -18,13 +18,23 @@ permissions:
   pull-requests: write
   issues: write
   contents: read
+# One review per PR at a time.
+concurrency:
+  group: openreview-${{ github.event.pull_request.number || github.event.issue.number || github.run_id }}
+  cancel-in-progress: false
 jobs:
   review:
+    # issue_comment runs in the BASE repo, so your secrets are live. Require an
+    # EXACT command from a sender with write access — otherwise any user can
+    # comment it on any PR and spend your provider budget. The action
+    # re-checks both rules itself; this gate just avoids starting the job.
     if: >
       github.event_name == 'pull_request' ||
       (github.event_name == 'issue_comment' &&
        github.event.issue.pull_request &&
-       contains(github.event.comment.body, '/review'))
+       github.event.sender.type != 'Bot' &&
+       contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association) &&
+       trim(github.event.comment.body) == '/review')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -37,6 +47,7 @@ jobs:
           # anthropic-api-key: ${{ secrets.ANTHROPIC_API_KEY }}
           # openai-api-key: ${{ secrets.OPENAI_API_KEY }}
           # log-level: debug # debug | info (default) | warn | error
+          # allowed-author-associations: "" # default = OWNER,MEMBER,COLLABORATOR
 ```
 
 ## 2. Add secrets

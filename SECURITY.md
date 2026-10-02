@@ -1,5 +1,8 @@
 # Security
 
 - BYOK keys stay in the consumer repo as GitHub Secrets; OpenReview never logs them (redacted, only passed as env to the runner).
-- Fork PRs: secrets are unavailable by default. OpenReview skips LLM calls without keys and posts a guidance comment. Use `/review` from a maintainer after checking out the fork, or a `pull_request_target` workflow if you accept the risk.
+- **Comment triggers are authorized.** `issue_comment` events run in the base repo, so repository secrets are live. OpenReview only runs a comment-triggered review when the comment body is *exactly* `defaults.command` (trimmed) **and** the sender's `author_association` is in `allowed-author-associations` (default `OWNER,MEMBER,COLLABORATOR` — anyone with write access). Anything else exits without spending a token or posting a comment. Keep the matching `if:` gate in your workflow too; the action's check is the safety net for stale workflows.
+- Fork PRs: `pull_request` events from forks get no secrets, so no LLM calls happen. To review them anyway, a maintainer comments the command after checking out the fork, or you use `pull_request_target` — which is a deliberate risk: it runs with a write token against code you checked out, so never check out the PR head there.
+- Self-hosted runners: for a public repo they execute code chosen by anyone who can open a PR. Prefer GitHub-hosted runners for public repos (their minutes are free for public repositories).
+- Prompt injection: PR diffs and file contents are attacker-controlled text sent to the model. Findings are rendered as comments/reviews, never executed, and keys are never included in prompts — but treat model output as untrusted data.
 - Report vulnerabilities via GitHub Security Advisories. No code is used for model training by OpenReview itself (provider policies apply).

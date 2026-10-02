@@ -10,7 +10,8 @@ version: 1 # schema version (required). Additive-only in v1.x.
 
 defaults:
   on: [opened, synchronize, ready_for_review]
-  command: "/review" # issue-comment trigger (checked by the workflow's if:)
+  command: "/review" # issue-comment trigger: must match EXACTLY (trimmed), and only an
+                     # author_association in allowed-author-associations may send it
   draft: false       # review draft PRs?
   lang: en
   ignore: ["**.lock", "dist/**"] # path globs skipped everywhere

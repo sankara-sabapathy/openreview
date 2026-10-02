@@ -33,6 +33,10 @@ inputs:
     description: "If true, log verdict without posting"
     required: false
     default: "false"
+  allowed-author-associations:
+    description: "Comma-separated GitHub author_association values allowed to trigger a review via comment (issue_comment only). Empty = OWNER,MEMBER,COLLABORATOR (i.e. anyone with write access)."
+    required: false
+    default: ""
   log-level:
     description: "Log verbosity: debug, info (default), warn, error"
     required: false

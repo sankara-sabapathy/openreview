@@ -14,6 +14,7 @@ import {
 import { renderStickyBody, upsertStickyComment, createInlineReview } from "./github.js";
 import { initLogger, logInfo, logWarning, logDebug } from "./logger.js";
 import { buildContextBlock } from "./context.js";
+import { authorizeTrigger } from "./authorize.js";
 
 const CONFIG_CANDIDATES = [
   ".github/openreview.yml",
@@ -93,6 +94,22 @@ export async function run(): Promise<void> {
       }
     }
     const keys = resolveKeysFromEnv(process.env as any);
+    // Authorization gate (issue #59): `issue_comment` runs in the BASE repo
+    // context, so the secrets are live. Without this, anyone on the internet
+    // could comment the command on any PR and spend the maintainer's keys.
+    // Runs before the diff fetch, the key resolution and every agent call.
+    const gate = authorizeTrigger({
+      eventName: process.env.GITHUB_EVENT_NAME ?? "",
+      commentBody: (ctx.payload as any).comment?.body,
+      authorAssociation: (ctx.payload as any).comment?.author_association,
+      command: config.defaults.command,
+      allowedAssociations: core.getInput("allowed-author-associations"),
+    });
+    if (!gate.allowed) {
+      // Exit 0: an unauthorized trigger must not paint a red X on a PR.
+      logWarning(`Trigger denied: ${gate.reason}. Nothing was reviewed or posted.`);
+      return;
+    }
     // Stable session per workflow run (required by OpenCode Go/Zen routing).
     const sessionId =
       process.env.GITHUB_RUN_ID ?? `${Date.now()}-${Math.random().toString(36).slice(2)}`;
