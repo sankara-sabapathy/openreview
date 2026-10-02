@@ -12,13 +12,12 @@ permissions:
 
 jobs:
   review:
-    # issue_comment runs in the BASE repo, so your secrets are live: require an
-    # EXACT command from a sender with write access. Otherwise any user can
-    # comment it on any PR and spend the maintainer's provider budget. The
-    # action re-checks both rules itself (defense in depth).
-    # NOTE: every continuation line is indented identically (6 spaces) so the
-    # folded scalar folds to ONE line - a more-indented line would be kept
-    # literal, and GitHub rejects an expression containing newlines.
+    # issue_comment runs in the BASE repo, so the secrets are live. Gate the
+    # sender on write access (author_association) so no random commenter can
+    # spend the maintainer's provider budget.
+    # The command match stays a cheap pre-filter: `trim()` does not exist in
+    # the Actions expression language, and the action itself enforces the EXACT
+    # command (defaults.command) plus this same association check.
     if: >-
       github.event_name == 'pull_request' ||
       (github.event_name == 'issue_comment' &&
@@ -27,7 +26,7 @@ jobs:
       (github.event.comment.author_association == 'OWNER' ||
       github.event.comment.author_association == 'MEMBER' ||
       github.event.comment.author_association == 'COLLABORATOR') &&
-      trim(github.event.comment.body) == '/review')
+      contains(github.event.comment.body, '/review'))
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
