@@ -44843,8 +44843,10 @@ class BodyWatchdogError extends Error {
 }
 /** Read a response body with two watchdogs (issue #41):
  * - idle: any `idleMs` window without a single byte kills the request;
- * - throughput: any rolling `windowMs` delivering fewer than `minWindowBytes`
- *   kills it (trickling streams that defeat the idle check).
+ * - throughput: any window of `windowMs` that delivered fewer than
+ *   `minWindowBytes` kills it (trickling streams that defeat the idle check).
+ *   Tumbling, not rolling: the window resets on the first read after a healthy
+ *   one, so a burst is credited to the window it lands in.
  * Slow-but-producing gateways survive both; dead hangs and trickles die fast.
  * Total cap is enforced separately by the caller's AbortController. Exported
  * for unit tests (feed it a real Response from a local trickle server).

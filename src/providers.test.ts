@@ -183,6 +183,10 @@ describe("readBodyWithIdleTimeout", () => {
   });
 
   it("lets a slow-but-producing stream through", async () => {
+    // 600B/100ms with a 500ms window and a 1KB threshold: every full window
+    // clears the threshold, so this also covers the window-RESET branch (7
+    // chunks over 700ms > 1 window) — the shorter version of this test used to
+    // end before the first window elapsed and never reached it.
     const { url, close } = await serve((_req, res) => {
       res.writeHead(200, { "content-type": "application/json" });
       let n = 0;
@@ -194,7 +198,7 @@ describe("readBodyWithIdleTimeout", () => {
           clearInterval(timer);
           return;
         }
-        if (n >= 3) {
+        if (n >= 7) {
           clearInterval(timer);
           try {
             res.end();
@@ -206,7 +210,42 @@ describe("readBodyWithIdleTimeout", () => {
     });
     try {
       const text = await readBodyWithIdleTimeout(await fetch(url, { headers: { connection: "close" } }), 2000, "t", 500, 1024);
-      assert.equal(text.length, 1800);
+      assert.equal(text.length, 4200);
+    } finally {
+      close();
+    }
+  });
+
+  it("forgives a tripped window once throughput recovers", async () => {
+    // Starve the first window, then produce normally: the trip is recorded, but
+    // a healthy window must clear it (trickleSince reset) instead of the stream
+    // dying one window later.
+    const { url, close } = await serve((_req, res) => {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.flushHeaders();
+      res.write("a"); // first trip candidate, far below the 1KB threshold
+      let n = 0;
+      const timer = setInterval(() => {
+        n++;
+        try {
+          res.write("z".repeat(700));
+        } catch {
+          clearInterval(timer);
+          return;
+        }
+        if (n >= 6) {
+          clearInterval(timer);
+          try {
+            res.end();
+          } catch {
+            // ignore
+          }
+        }
+      }, 100);
+    });
+    try {
+      const text = await readBodyWithIdleTimeout(await fetch(url, { headers: { connection: "close" } }), 3000, "t", 500, 1024);
+      assert.equal(text.length, 1 + 6 * 700);
     } finally {
       close();
     }
