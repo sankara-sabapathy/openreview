@@ -5,6 +5,16 @@ on:
   pull_request:
 
 jobs:
+  # Workflow syntax gate. A bad expression (e.g. calling a function that does
+  # not exist in the Actions expression language) does NOT fail `ci` — it only
+  # shows as a 0s red run in the Actions tab, which is easy to miss. Since the
+  # trigger is what gates who can spend the repo's API budget, lint it.
+  lint-workflows:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: rhysd/actionlint@v1.7.12
+
   build:
     runs-on: ubuntu-latest
     steps:
