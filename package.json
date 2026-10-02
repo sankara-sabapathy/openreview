@@ -9,7 +9,8 @@
     "package": "npx @vercel/ncc build dist-src/index.js -o dist --source-map --license licenses.txt",
     "typecheck": "tsc --noEmit",
     "test": "node --test dist-src/",
-    "docs:validate": "node dist-src/validate.js"
+    "docs:validate": "node dist-src/validate.js",
+    "probe:model": "node scripts/model-probe.mjs"
   },
   "dependencies": {
     "@actions/core": "^1.11.1",

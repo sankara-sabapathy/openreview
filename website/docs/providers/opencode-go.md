@@ -65,15 +65,30 @@ providers:
     json_mode: false   # the parser tolerates prose-wrapped JSON; no need to depend on it
 ```
 
-> **Reasoning models cost more than they look.** `deepseek-v4-flash` and similar
-> thinking models emit 100k+ **reasoning** tokens per agent (one live run logged
-> 131k) and may answer with an *empty* `content` field — which OpenReview sees as
-> an empty response and retries. Expect both a long run and a large usage
-> number. If your reviewer is a reasoning model, budget for it; if you want cheap
-> and fast, pick a non-reasoning model. OpenReview reads `reasoning_content` as a
-> fallback ([#26](https://github.com/sankara-sabapathy/openreview/issues/26)) but
-> reports reasoning tokens inside `completion_tokens`, so the usage footer
-> overstates visible output for those models.
+> **Reasoning models cost more than they look — measure before you assume.**
+> Most modern models think to some degree, including both free ones above, so
+> "is it a reasoning model" is the wrong question; **how much does it think** is
+> the right one. `npm run probe:model` answers it directly:
+>
+> ```
+> {"model":"longcat-2.5-preview-free","reasoning":147,"content":5,"completion_tokens":38,"verdict":"REASONING"}
+> {"model":"space-bunny-free","reasoning":0,"content":5,"completion_tokens":3,"verdict":"plain"}
+> {"model":"deepseek-v4-flash","reasoning":151,"content":5,"completion_tokens":41,"verdict":"REASONING"}
+> ```
+>
+> The tells, strongest first: a non-empty `reasoning_content` field; then
+> `completion_tokens` far exceeding the visible answer length (thinking is billed
+> inside `completion_tokens`, so the usage footer overstates real output for
+> these models); then `finish_reason: "length"` with empty content, meaning the
+> thinking ate the whole `max_tokens` budget.
+>
+> In practice `deepseek-v4-flash` billed **100k+ reasoning tokens** on a full PR
+> diff and sometimes returned an *empty* `content` field, which OpenReview read
+> as an empty response and retried — 10+ minute runs. The free models reason far
+> more briefly (~300-1200 chars on a small diff) and returned valid findings JSON
+> on 3/3 probe runs. If a reviewer is slow and expensive, probe it before you
+> trust it. OpenReview reads `reasoning_content` as a fallback
+> ([#26](https://github.com/sankara-sabapathy/openreview/issues/26)).
 
 > **Known flake (2026-09-30, [issue #30](https://github.com/sankara-sabapathy/openreview/issues/30)):**
 > `glm-5.3-flash` intermittently returns **empty content** (upstream thinking

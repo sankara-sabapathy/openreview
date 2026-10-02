@@ -35,11 +35,14 @@ providers:
   # Go lists exactly two free models: `space-bunny-free` (reserved for
   # day-to-day development, deliberately not used for reviews) and
   # `longcat-2.5-preview-free`, which is what we use here.
-  # Do NOT switch back to deepseek-v4-flash casually: it is a REASONING model,
-  # so each agent burned 100k+ reasoning tokens (131k on one run) and answered
-  # with an empty `content` field — the dominant cause of 10+ minute runs and
-  # of "empty content" retries. LongCat answers in `content`, which is also
-  # cheaper and faster. See #26.
+  #
+  # BOTH free models are reasoning models — the difference is thinking VOLUME,
+  # not reasoning on/off. Measured with `npm run probe:model` on a small diff:
+  # longcat-free emits ~300-1200 chars of reasoning_content and ~250-470 output
+  # tokens, and returned valid findings JSON on 3/3 runs. deepseek-v4-flash,
+  # by contrast, billed 100k+ reasoning tokens on a full PR diff and sometimes
+  # answered with an empty `content` field (retried as "empty content"). That
+  # gap — not the price tier — is what made runs 10+ minutes. See #26.
   opencode:
     # kind: is a deprecated shorthand (anthropic|openai|opencode|openai-compatible).
     # Prefer protocol below; both are shown here for reference.
