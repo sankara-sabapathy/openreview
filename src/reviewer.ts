@@ -54,6 +54,16 @@ export function dedupeFindings<T extends { file: string; line?: number; comment:
   return out;
 }
 
+/**
+ * A review where only some agents produced a usable result must not report a
+ * clean pass: we did not get the whole picture (issue #46). Blocking verdicts
+ * are preserved — a degraded review can still escalate.
+ */
+export function applyDegradedFloor(verdict: Verdict, counted: number, total: number): Verdict {
+  if (counted <= 0 || counted >= total) return verdict;
+  return verdict === "approve" ? "comment" : verdict;
+}
+
 export type Verdict = "approve" | "comment" | "request_changes";
 
 export type NoiseProfile = "quiet" | "balanced" | "assertive";
@@ -110,14 +120,17 @@ export function decideReviewVerdict(
 }
 
 /**
- * Combine per-review verdicts (issue #45). Fail-closed: a blocking verdict is
- * never outvoted into `approve`, and ties never resolve toward `approve`.
+ * Combine per-review verdicts (issue #45). Fail-closed: without a quorum of
+ * approvals the result is the most severe verdict on the table, so a lone
+ * `request_changes` is never outvoted into `approve` and the result never
+ * depends on the order reviews were declared in.
  * - any_blocking / max_severity: most severe verdict wins (max_severity is a
  *   documented alias — both are the same operation on verdict enums).
- * - majority: `approve` requires a quorum (> half); otherwise the most severe
- *   verdict on the table wins. Before this rule, ['approve','comment',
- *   'request_changes'] resolved to `approve` and ties depended on the order
- *   reviews happened to be declared in.
+ * - majority: `approve` iff a quorum (> half) approved — which is the whole
+ *   point of opting into `majority`, so 3 approvals DO outvote 1 request_changes
+ *   here. Without that quorum the most severe verdict wins, and ties never
+ *   resolve toward `approve`. Before this rule, ['approve','comment',
+ *   'request_changes'] resolved to `approve`.
  */
 export function combineVerdicts(
   verdicts: Verdict[],

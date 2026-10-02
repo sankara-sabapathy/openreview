@@ -10,6 +10,7 @@ import {
   applyNoiseControls,
   resolveNoise,
   satisfiesActionVersion,
+  applyDegradedFloor,
 } from "./reviewer.js";
 
 type V = "approve" | "comment" | "request_changes";
@@ -84,6 +85,26 @@ describe("combineVerdicts (issue #45)", () => {
     assert.equal(combineVerdicts(["comment", "approve"], "majority"), "comment");
   });
 
+  it("majority does outvote a lone blocker once approvals form a quorum", () => {
+    // This is the documented meaning of opting into `majority` (flagged by the
+    // dogfood review on #62 as a comment/reality mismatch) — pinned so the
+    // wording in the doc comment cannot drift again.
+    assert.equal(
+      combineVerdicts(["approve", "approve", "approve", "request_changes"], "majority"),
+      "approve"
+    );
+    // …but a lone blocker survives whenever approvals are NOT a quorum.
+    assert.equal(
+      combineVerdicts(["approve", "approve", "request_changes"], "majority"),
+      "approve" // 2 of 3 is still a quorum
+    );
+    assert.equal(
+      combineVerdicts(["approve", "comment", "request_changes"], "majority"),
+      "request_changes"
+    );
+    assert.equal(combineVerdicts(["approve", "request_changes"], "majority"), "request_changes");
+  });
+
   it("an empty set is never approve (fail-closed for a fully failed run)", () => {
     for (const strategy of strategies) {
       assert.equal(combineVerdicts([], strategy), "comment");
@@ -154,6 +175,24 @@ describe("filterIgnored", () => {
     assert.deepEqual(filterIgnored(files, ["dist/**"]), ["src/a.ts", "src/b.ts", "package-lock.json"]);
     assert.deepEqual(filterIgnored(files, ["src/**", "dist/**"]), ["package-lock.json"]);
     assert.deepEqual(filterIgnored(files, []), files);
+  });
+});
+
+describe("applyDegradedFloor (issue #46)", () => {
+  it("a fully-run review keeps its verdict", () => {
+    assert.equal(applyDegradedFloor("approve", 2, 2), "approve");
+    assert.equal(applyDegradedFloor("request_changes", 3, 3), "request_changes");
+  });
+  it("a partially-failed review cannot report a clean pass", () => {
+    assert.equal(applyDegradedFloor("approve", 1, 2), "comment");
+    assert.equal(applyDegradedFloor("approve", 2, 3), "comment");
+  });
+  it("a degraded review can still escalate", () => {
+    assert.equal(applyDegradedFloor("request_changes", 1, 3), "request_changes");
+    assert.equal(applyDegradedFloor("comment", 1, 3), "comment");
+  });
+  it("nothing reviewed is left to the caller's exclusion", () => {
+    assert.equal(applyDegradedFloor("approve", 0, 2), "approve");
   });
 });
 

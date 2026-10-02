@@ -14,8 +14,8 @@ import {
   type AgentOutcome,
 } from "./providers.js";
 import {
-  matchesAny, filterIgnored, dedupeFindings,
-  decideReviewVerdict, combineVerdicts, combineBallots, resolveNoise, applyNoiseControls, type Verdict,
+  matchesAny, filterIgnored, dedupeFindings, decideReviewVerdict, combineVerdicts, combineBallots,
+  applyDegradedFloor, resolveNoise, applyNoiseControls, type Verdict,
   satisfiesActionVersion, runningActionVersion,
 } from "./reviewer.js";
 import { renderStickyBody, upsertStickyComment, createInlineReview, type RunStatus } from "./github.js";
@@ -252,6 +252,10 @@ export async function run(): Promise<void> {
       // errored contributed NO usable signal, so it must not cast an approving
       // ballot — "no findings because nothing ran" is not "no findings found".
       const counted = results.filter((r) => countsAsReview(r.outcome)).length;
+      // A partially-failed review DID get a look, but not the whole picture, so
+      // it may not report a clean pass either: floor it at `comment` rather
+      // than dropping its findings or claiming everything was checked.
+      const degraded = counted > 0 && counted < results.length;
       const verdict = (() => {
         if (counted === 0) return "approve" as Verdict; // placeholder, excluded below
         // One ballot per distinct provider (issue #12). `any` reproduces the
@@ -267,7 +271,14 @@ export async function run(): Promise<void> {
           logInfo(`Review ${review.id}: ballot ${name} -> ${v} (${fs.length} findings)`);
           return v;
         });
-        return combineBallots(ballots, review.strategy);
+        const base = combineBallots(ballots, review.strategy);
+        if (degraded) {
+          logWarning(
+            `Review ${review.id}: only ${counted}/${results.length} agents reviewed — ` +
+              `flooring the verdict instead of reporting a clean approve.`
+          );
+        }
+        return applyDegradedFloor(base, counted, results.length);
       })();
       perReview.push({
         id: review.id,
@@ -300,7 +311,15 @@ export async function run(): Promise<void> {
     }
 
     if (perReview.length === 0) {
-      logInfo("No review matched any path in the diff; nothing to do.");
+      // Still publish both outputs: a consumer branching on
+      // steps.review.outputs.verdict must not see an empty string here (the
+      // dogfood review on #62 caught this regression).
+      core.setOutput("verdict", "comment");
+      core.setOutput("review_status", "error");
+      logWarning(
+        "No review matched any path in the diff (check if_paths / defaults.ignore) — " +
+          "nothing was reviewed. review_status=error."
+      );
       return;
     }
 

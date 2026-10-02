@@ -45301,6 +45301,16 @@ function dedupeFindings(findings) {
     }
     return out;
 }
+/**
+ * A review where only some agents produced a usable result must not report a
+ * clean pass: we did not get the whole picture (issue #46). Blocking verdicts
+ * are preserved — a degraded review can still escalate.
+ */
+function applyDegradedFloor(verdict, counted, total) {
+    if (counted <= 0 || counted >= total)
+        return verdict;
+    return verdict === "approve" ? "comment" : verdict;
+}
 // Presets for noise control. balanced ≈ historical behavior (no effective
 // filtering: floor 0, cap above the display limits). Severity stays owned by
 // verdict.min_severity; profiles only add confidence + cap.
@@ -45332,14 +45342,17 @@ function decideReviewVerdict(mode, minSeverity, findings) {
     return mode;
 }
 /**
- * Combine per-review verdicts (issue #45). Fail-closed: a blocking verdict is
- * never outvoted into `approve`, and ties never resolve toward `approve`.
+ * Combine per-review verdicts (issue #45). Fail-closed: without a quorum of
+ * approvals the result is the most severe verdict on the table, so a lone
+ * `request_changes` is never outvoted into `approve` and the result never
+ * depends on the order reviews were declared in.
  * - any_blocking / max_severity: most severe verdict wins (max_severity is a
  *   documented alias — both are the same operation on verdict enums).
- * - majority: `approve` requires a quorum (> half); otherwise the most severe
- *   verdict on the table wins. Before this rule, ['approve','comment',
- *   'request_changes'] resolved to `approve` and ties depended on the order
- *   reviews happened to be declared in.
+ * - majority: `approve` iff a quorum (> half) approved — which is the whole
+ *   point of opting into `majority`, so 3 approvals DO outvote 1 request_changes
+ *   here. Without that quorum the most severe verdict wins, and ties never
+ *   resolve toward `approve`. Before this rule, ['approve','comment',
+ *   'request_changes'] resolved to `approve`.
  */
 function combineVerdicts(verdicts, strategy) {
     if (verdicts.length === 0)
@@ -46119,6 +46132,10 @@ async function run() {
             // errored contributed NO usable signal, so it must not cast an approving
             // ballot — "no findings because nothing ran" is not "no findings found".
             const counted = results.filter((r) => countsAsReview(r.outcome)).length;
+            // A partially-failed review DID get a look, but not the whole picture, so
+            // it may not report a clean pass either: floor it at `comment` rather
+            // than dropping its findings or claiming everything was checked.
+            const degraded = counted > 0 && counted < results.length;
             const verdict = (() => {
                 if (counted === 0)
                     return "approve"; // placeholder, excluded below
@@ -46135,7 +46152,12 @@ async function run() {
                     logInfo(`Review ${review.id}: ballot ${name} -> ${v} (${fs.length} findings)`);
                     return v;
                 });
-                return combineBallots(ballots, review.strategy);
+                const base = combineBallots(ballots, review.strategy);
+                if (degraded) {
+                    logWarning(`Review ${review.id}: only ${counted}/${results.length} agents reviewed — ` +
+                        `flooring the verdict instead of reporting a clean approve.`);
+                }
+                return applyDegradedFloor(base, counted, results.length);
             })();
             perReview.push({
                 id: review.id,
@@ -46165,7 +46187,13 @@ async function run() {
             logInfo(`Review ${review.id}: ${findings.length} findings -> ${verdict}${counted > 0 ? "" : " (excluded)"}`);
         }
         if (perReview.length === 0) {
-            logInfo("No review matched any path in the diff; nothing to do.");
+            // Still publish both outputs: a consumer branching on
+            // steps.review.outputs.verdict must not see an empty string here (the
+            // dogfood review on #62 caught this regression).
+            core.setOutput("verdict", "comment");
+            core.setOutput("review_status", "error");
+            logWarning("No review matched any path in the diff (check if_paths / defaults.ignore) — " +
+                "nothing was reviewed. review_status=error.");
             return;
         }
         // Only reviews that actually ran vote; a run where nothing did is reported
