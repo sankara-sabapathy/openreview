@@ -170,8 +170,12 @@ describe("readBodyWithIdleTimeout", () => {
         ),
         /trickle timeout/
       );
-      // Give the cancel a beat to propagate to the server side.
-      await new Promise((r) => setTimeout(r, 250));
+      // The cancel is async and the server-side close event lags it, so poll
+      // for eventual release instead of asserting at a fixed instant.
+      const deadline = Date.now() + 5000;
+      while (openSockets() > 0 && Date.now() < deadline) {
+        await new Promise((r) => setTimeout(r, 50));
+      }
       assert.equal(openSockets(), 0, "trickle path must release the socket");
     } finally {
       close();
