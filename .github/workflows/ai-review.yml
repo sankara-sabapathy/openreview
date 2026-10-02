@@ -12,11 +12,22 @@ permissions:
 
 jobs:
   review:
-    if: >
+    # issue_comment runs in the BASE repo, so your secrets are live: require an
+    # EXACT command from a sender with write access. Otherwise any user can
+    # comment it on any PR and spend the maintainer's provider budget. The
+    # action re-checks both rules itself (defense in depth).
+    # NOTE: every continuation line is indented identically (6 spaces) so the
+    # folded scalar folds to ONE line - a more-indented line would be kept
+    # literal, and GitHub rejects an expression containing newlines.
+    if: >-
       github.event_name == 'pull_request' ||
       (github.event_name == 'issue_comment' &&
-       github.event.issue.pull_request &&
-       contains(github.event.comment.body, '/review'))
+      github.event.issue.pull_request &&
+      github.event.sender.type != 'Bot' &&
+      (github.event.comment.author_association == 'OWNER' ||
+      github.event.comment.author_association == 'MEMBER' ||
+      github.event.comment.author_association == 'COLLABORATOR') &&
+      trim(github.event.comment.body) == '/review')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
