@@ -32,7 +32,10 @@ providers:
     kind: opencode
     model: big-pickle
     key_from: secrets.OPENCODE_API_KEY
-    base_url: https://opencode.ai/zen/v1 # Go subscription: https://opencode.ai/zen/go/v1 (models: glm-5.3-flash, kimi-k2.7-code, ...)
+    base_url: https://opencode.ai/zen/v1 # Go subscription: https://opencode.ai/zen/go/v1
+                                     # Go ships two FREE models: longcat-2.5-preview-free
+                                     # and space-bunny-free (good defaults for frequent runs)
+                                     # other Go models: glm-5.3-flash, kimi-k2.7-code, ...
     # retries: 2 # retry budget for empty/5xx/429/network (0-5, default 2)
     # timeout_s: 420 # per-attempt TOTAL cap, seconds (default 420); 90s idle + 60s/1KB trickle guards always on
   # Claude subscription (Pro/Max/Team/Enterprise) via OAuth instead of API key:

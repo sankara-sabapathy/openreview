@@ -32,10 +32,10 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      # Final commit before merge: back to the published action (AGENTS.md
-      # convention). The previous commit used `uses: ./` so the dogfood review
-      # exercised this branch instead of the last release.
-      - uses: sankara-sabapathy/openreview@v1
+      # TEMPORARY (AGENTS.md convention): review PRs with this branch's code so
+      # the model change below is exercised live, not against the last release.
+      # The final commit before merge restores sankara-sabapathy/openreview@v1.
+      - uses: ./
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           config-path: .github/openreview.yml

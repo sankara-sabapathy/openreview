@@ -31,20 +31,31 @@ defaults:
   max_concurrency: 4
 
 providers:
-  # --- Active: OpenCode Go (deepseek-v4-flash: reliable live, 8 findings on
-  # --- PR #33; kimi solid backup; glm-5.3-flash flaked empty — issue #30) ---
+  # --- Active: OpenCode Go, free tier ---
+  # Go lists exactly two free models: `space-bunny-free` (reserved for
+  # day-to-day development, deliberately not used for reviews) and
+  # `longcat-2.5-preview-free`, which is what we use here.
+  # Do NOT switch back to deepseek-v4-flash casually: it is a REASONING model,
+  # so each agent burned 100k+ reasoning tokens (131k on one run) and answered
+  # with an empty `content` field — the dominant cause of 10+ minute runs and
+  # of "empty content" retries. LongCat answers in `content`, which is also
+  # cheaper and faster. See #26.
   opencode:
     # kind: is a deprecated shorthand (anthropic|openai|opencode|openai-compatible).
     # Prefer protocol below; both are shown here for reference.
     kind: opencode
     protocol: openai-chat # openai-chat | anthropic-messages
-    model: deepseek-v4-flash
+    model: longcat-2.5-preview-free
     base_url: https://opencode.ai/zen/go/v1
     key_from: secrets.OPENCODE_API_KEY # any $NAME: "secrets.FOO" | "env.FOO"
+    # The parser now tolerates prose-wrapped JSON (see #54), so we do not need
+    # json_object mode and avoid depending on it from a preview-tier model.
+    json_mode: false
     # auth: { header: Authorization, scheme: Bearer } # defaults shown; Azure uses { header: api-key, scheme: "" }
     # headers: { X-Custom: value } # extra headers merged into every request
     # endpoint_path: /chat/completions # default per protocol (/chat/completions, /v1/messages)
-    # json_mode: true # set false for providers rejecting response_format
+    # json_mode: true is the default; set false for providers that reject
+    # response_format — this config sets it explicitly, see above.
     # extra_body: { temperature: 0.1 } # extra JSON body fields merged into requests
     # retries: 2 # attempts after the first for empty/5xx/429/network (0-5)
     # timeout_s: 420 # per-attempt TOTAL cap in seconds (10-600); 90s idle + 60s/1KB trickle guards always on
