@@ -45,6 +45,9 @@ outputs:
   verdict:
     description: "Global verdict: approve|comment|request_changes"
     value: ${{ steps.review.outputs.verdict }}
+  review_status:
+    description: "Run status: ok (all reviews ran) | partial (some produced no usable result) | error (nothing was reviewed — verdict is NOT a pass)"
+    value: ${{ steps.review.outputs.review_status }}
 runs:
   using: "node24"
   main: "dist/index.js"

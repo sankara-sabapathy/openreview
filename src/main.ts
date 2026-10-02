@@ -5,13 +5,20 @@ import { existsSync } from "node:fs";
 import * as YAML from "yaml";
 import { parseConfig } from "./config.js";
 import { templateContextFor, resolveExtends, mergeConfigs, parseConfigLoose } from "./templates.js";
-import { resolveKeysFromEnv, runAgent, formatTokens, type Finding } from "./providers.js";
+import {
+  resolveKeysFromEnv,
+  runAgent,
+  formatTokens,
+  countsAsReview,
+  type Finding,
+  type AgentOutcome,
+} from "./providers.js";
 import {
   matchesAny, filterIgnored, dedupeFindings,
   decideReviewVerdict, combineVerdicts, combineBallots, resolveNoise, applyNoiseControls, type Verdict,
   satisfiesActionVersion, runningActionVersion,
 } from "./reviewer.js";
-import { renderStickyBody, upsertStickyComment, createInlineReview } from "./github.js";
+import { renderStickyBody, upsertStickyComment, createInlineReview, type RunStatus } from "./github.js";
 import { initLogger, logInfo, logWarning, logDebug } from "./logger.js";
 import { buildContextBlock } from "./context.js";
 import { authorizeTrigger } from "./authorize.js";
@@ -123,11 +130,21 @@ export async function run(): Promise<void> {
       return;
     }
 
+    type AgentRun = {
+      agent: string;
+      providerName: string;
+      outcome: AgentOutcome;
+      seconds: number;
+      error?: string;
+    };
     const perReview: {
       id: string;
       verdict: Verdict;
       findings: Finding[];
       errors: string[];
+      /** Agents that actually reviewed (issue #46: only these may vote). */
+      counted: boolean;
+      agents: AgentRun[];
       usage: { agent: string; model: string; usage: { in: number; out: number }; seconds: number }[];
     }[] = [];
     for (const review of config.reviews) {
@@ -154,6 +171,7 @@ export async function run(): Promise<void> {
         usage: { in: number; out: number } | null;
         seconds: number;
         error?: string;
+        outcome: AgentOutcome;
         agent: string;
         providerName: string;
       }>[] = [];
@@ -189,6 +207,7 @@ export async function run(): Promise<void> {
               findings: result.findings,
               usage: result.usage,
               seconds: result.seconds,
+              outcome: result.outcome,
               agent: a.name ?? "agent",
               providerName: a.provider,
             }))
@@ -200,6 +219,7 @@ export async function run(): Promise<void> {
                 usage: null,
                 seconds: 0,
                 error: msg,
+                outcome: "error" as const,
                 agent: a.name ?? "agent",
                 providerName: a.provider,
               };
@@ -228,7 +248,12 @@ export async function run(): Promise<void> {
         ({ high: 0, medium: 1, suggestion: 2 } as const)[a.severity] -
         ({ high: 0, medium: 1, suggestion: 2 } as const)[b.severity]
       );
+      // Fail closed (issue #46): a review whose every agent was skipped or
+      // errored contributed NO usable signal, so it must not cast an approving
+      // ballot — "no findings because nothing ran" is not "no findings found".
+      const counted = results.filter((r) => countsAsReview(r.outcome)).length;
       const verdict = (() => {
+        if (counted === 0) return "approve" as Verdict; // placeholder, excluded below
         // One ballot per distinct provider (issue #12). `any` reproduces the
         // old pooled behavior exactly; `all`/`majority` resolve disagreement.
         const byProvider = new Map<string, typeof findings>();
@@ -249,6 +274,13 @@ export async function run(): Promise<void> {
         verdict,
         findings,
         errors: agentErrors,
+        counted: counted > 0,
+        agents: results.map((r) => ({
+          agent: r.agent,
+          providerName: r.providerName,
+          outcome: r.outcome,
+          seconds: r.seconds,
+        })),
         usage: results
           .filter((r) => r.usage)
           .map((r) => ({
@@ -258,24 +290,61 @@ export async function run(): Promise<void> {
             seconds: r.seconds,
           })),
       });
-      logInfo(`Review ${review.id}: ${findings.length} findings -> ${verdict}`);
+      if (counted === 0) {
+        logWarning(
+          `Review ${review.id}: ${results.length} agent(s), none reviewed (no usable result) — ` +
+            `excluded from the verdict.`
+        );
+      }
+      logInfo(`Review ${review.id}: ${findings.length} findings -> ${verdict}${counted > 0 ? "" : " (excluded)"}`);
     }
 
+    if (perReview.length === 0) {
+      logInfo("No review matched any path in the diff; nothing to do.");
+      return;
+    }
+
+    // Only reviews that actually ran vote; a run where nothing did is reported
+    // as `error` and can never come out as approve (issue #46).
+    const countedReviews = perReview.filter((r) => r.counted);
     const global = combineVerdicts(
-      perReview.map((r) => r.verdict),
+      countedReviews.map((r) => r.verdict),
       config.global_verdict.strategy
     );
+    const status: RunStatus =
+      countedReviews.length === 0
+        ? "error"
+        : countedReviews.length < perReview.length
+        ? "partial"
+        : "ok";
     const all = perReview.flatMap((r) => r.findings);
     core.setOutput("verdict", global);
+    core.setOutput("review_status", status);
 
     const runUrl = `${process.env.GITHUB_SERVER_URL ?? "https://github.com"}/${owner}/${repo}/actions/runs/${process.env.GITHUB_RUN_ID ?? ""}`;
     const stickyBase = renderStickyBody({
       verdict: global,
-      perReview: perReview.map((r) => ({ id: r.id, verdict: r.verdict, count: r.findings.length })),
+      status,
+      perReview: perReview.map((r) => ({
+        id: r.id,
+        verdict: r.verdict,
+        count: r.findings.length,
+        counted: r.counted,
+      })),
+      agents: perReview.flatMap((r) =>
+        r.agents.map((a) => ({
+          ...a,
+          provider: a.providerName,
+          review: r.id,
+        }))
+      ),
       findings: all,
       runUrl,
     });
-    const hasAnyKey = Boolean(keys.anthropicApiKey || keys.openaiApiKey || keys.opencodeApiKey);
+    // Derived from actual agent outcomes, not from a hardcoded list of three
+    // env var names — a config using key_from: env.GROQ_API_KEY used to be told
+    // "No provider API keys configured" on a fully successful run (issue #49).
+    const skippedNoKey = perReview.flatMap((r) => r.agents).filter((a) => a.outcome === "skipped-no-key");
     const allErrors = perReview.flatMap((r) => r.errors);
     // Consolidated usage, grouped by model: "model 12.3k/1.1k 38t/s".
     const usageByModel = new Map<string, { In: number; Out: number; seconds: number }>();
@@ -300,14 +369,22 @@ export async function run(): Promise<void> {
       sticky += `\n<sub>Models: ${usageLine}</sub>`;
       logInfo(`Usage: ${usageLine}`);
     }
-    if (!hasAnyKey) {
-      sticky += `\n\n> ⚠️ No provider API keys configured — agents were skipped. Add \`ANTHROPIC_API_KEY\`, \`OPENAI_API_KEY\`, or \`OPENCODE_API_KEY\` as repo Actions secrets (only the ones your \`providers{}\` use).`;
-    } else if (all.length === 0 && allErrors.length > 0) {
-      sticky += `\n\n<details><summary>⚠️ All agents failed — details</summary>\n\n${allErrors.join("\n")}\n\nCheck model IDs and base URLs against provider docs.</details>`;
+    if (skippedNoKey.length > 0) {
+      const names = [...new Set(skippedNoKey.map((a) => a.agent))].map((a) => `\`${a}\``).join(", ");
+      sticky +=
+        `\n\n> ⚠️ ${skippedNoKey.length} agent(s) skipped — no API key for their provider: ${names}. ` +
+        `Add the secret each provider's \`key_from\` names (see \`.github/openreview.yml\`).`;
+      logWarning(`${skippedNoKey.length} agent(s) skipped for a missing API key: ${names}`);
     }
-
+    if (allErrors.length > 0) {
+      const scope =
+        status === "error"
+          ? "⚠️ All agents failed — no review completed"
+          : `⚠️ ${allErrors.length} agent error(s)`;
+      sticky += `\n\n<details><summary>${scope} — details</summary>\n\n${allErrors.join("\n")}\n\nCheck model IDs and base URLs against the provider docs. Secrets are never logged.</details>`;
+    }
     if (dryRun) {
-      logInfo(`DRY RUN verdict=${global}\n${sticky.slice(0, 2000)}`);
+      logInfo(`DRY RUN verdict=${global} status=${status}\n${sticky.slice(0, 2000)}`);
       return;
     }
     if (config.global_verdict.sticky_comment) {

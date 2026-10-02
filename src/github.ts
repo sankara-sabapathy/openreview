@@ -15,9 +15,27 @@ export function logoUrl(): string {
   return `https://raw.githubusercontent.com/${repo}/${ref}/assets/logo.svg`;
 }
 
+export type RunStatus = "ok" | "partial" | "error";
+
+const OUTCOME_LABEL: Record<string, string> = {
+  ok: "✅ reviewed",
+  "no-findings": "✅ no findings",
+  "skipped-no-key": "⏭️ skipped (no key)",
+  unparseable: "⚠️ unusable response",
+  error: "❌ failed",
+};
+
 export function renderStickyBody(opts: {
   verdict: string;
-  perReview: { id: string; verdict: string; count: number }[];
+  status?: RunStatus;
+  perReview: { id: string; verdict: string; count: number; counted?: boolean }[];
+  agents?: {
+    review: string;
+    agent: string;
+    provider: string;
+    outcome: string;
+    seconds: number;
+  }[];
   findings: {
     file: string;
     line?: number;
@@ -29,20 +47,45 @@ export function renderStickyBody(opts: {
   }[];
   runUrl?: string;
 }): string {
+  const status = opts.status ?? "ok";
   const lines: string[] = [];
   lines.push(STICKY_MARKER);
   lines.push(
     `<img src="${logoUrl()}" width="28" height="28" align="left" alt="OpenReview AI" />`
   );
-  lines.push(`## OpenReview AI — ${opts.verdict.replace(/_/g, " ").toUpperCase()}`);
+  // Fail loud: a run where nothing was reviewed must never read as a pass
+  // (issue #46). "APPROVE / No actionable findings. Nice work." was printed for
+  // runs where every agent had errored.
+  lines.push(
+    status === "error"
+      ? `## OpenReview AI — REVIEW FAILED`
+      : `## OpenReview AI — ${opts.verdict.replace(/_/g, " ").toUpperCase()}`
+  );
   lines.push("");
   lines.push("<br />");
   lines.push("");
+  if (status === "partial") {
+    const failed = opts.perReview.filter((r) => r.counted === false).map((r) => r.id);
+    lines.push(
+      `> ⚠️ **Partial review** — ${failed.map((i) => `\`${i}\``).join(", ")} produced no usable result and did not vote.`
+    );
+    lines.push("");
+  }
   for (const r of opts.perReview)
-    lines.push(`- \`${r.id}\`: **${r.verdict}** (${r.count} findings)`);
+    lines.push(
+      `- \`${r.id}\`: **${r.counted === false ? "not reviewed" : r.verdict}** (${r.count} findings)`
+    );
   lines.push("");
+  if (status === "error") {
+    lines.push("**No review completed.** The verdict below is not a pass — see the agent results.");
+    lines.push("");
+  }
   if (opts.findings.length === 0) {
-    lines.push("No actionable findings. Nice work.");
+    lines.push(
+      status === "ok"
+        ? "No actionable findings. Nice work."
+        : "No findings were produced (the run did not complete cleanly)."
+    );
   } else {
     lines.push("| Severity | File | Finding | Agent |");
     lines.push("|---|---|---|---|");
@@ -53,6 +96,24 @@ export function renderStickyBody(opts: {
     }
     if (opts.findings.length > 50)
       lines.push(`\n… and ${opts.findings.length - 50} more (see inline comments).`);
+  }
+  const agents = opts.agents ?? [];
+  const rough = agents.filter((a) => a.outcome !== "ok" && a.outcome !== "no-findings");
+  if (agents.length > 0) {
+    lines.push("");
+    lines.push(
+      `<details><summary>🤖 ${agents.length} agent(s)${rough.length ? ` — ${rough.length} not clean` : ""}</summary>`
+    );
+    lines.push("");
+    lines.push("| Agent | Provider | Outcome | Time |");
+    lines.push("|---|---|---|---|");
+    for (const a of agents) {
+      lines.push(
+        `| ${a.agent} | ${a.provider} | ${OUTCOME_LABEL[a.outcome] ?? a.outcome} | ${a.seconds.toFixed(1)}s |`
+      );
+    }
+    lines.push("");
+    lines.push("</details>");
   }
   if (opts.runUrl) lines.push(`\n<sub>Run: ${opts.runUrl}</sub>`);
   lines.push(`\n<sub>Re-review with \`/review\`. Config: \`.github/openreview.yml\`.</sub>`);

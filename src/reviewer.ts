@@ -6,17 +6,32 @@ export function matchesAny(path: string, patterns: string[]): boolean {
 // Minimal glob: supports **, *, exact. Good enough for path scoping without deps.
 export function matchGlob(path: string, pattern: string): boolean {
   if (pattern === "**" || pattern === "**/**") return true;
-  const rx = pattern
-    .split("/")
-    .map((seg) => {
-      if (seg === "**") return ".*";
-      return (
-        "(?:" +
-        seg.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, "[^/]*") +
-        ")"
-      );
-    })
-    .join("/");
+  const segs = pattern.split("/");
+  let rx = "";
+  for (let i = 0; i < segs.length; i++) {
+    const seg = segs[i];
+    const last = i === segs.length - 1;
+    if (seg === "**") {
+      // A whole `**` segment means "zero or more path segments", so `**/*.ts`
+      // matches BOTH `main.ts` and `src/a/b.ts`. Emitting `.*` here instead
+      // required a following "/", which silently dropped every root-level file
+      // (issue #48).
+      rx += last ? ".*" : "(?:[^/]+/)*";
+      continue;
+    }
+    // Inside a segment, `**` keeps its legacy "crosses directories" meaning
+    // (`**.lock` still matches `sub/dir/x.lock`, as shipped configs rely on)
+    // and a lone `*` stays within one segment.
+    const body = seg
+      .replace(/[.+^${}()|[\]\\]/g, "\\$&")
+      // split/join (not sequential replaces): substituting `**` -> `.*` first
+      // would let the single-star pass rewrite the `*` inside that `.*`.
+      .split("**")
+      .map((part) => part.replace(/\*/g, "[^/]*"))
+      .join(".*");
+    rx += `(?:${body})`;
+    if (!last) rx += "/";
+  }
   return new RegExp(`^${rx}$`).test(path);
 }
 
@@ -94,23 +109,31 @@ export function decideReviewVerdict(
   return mode;
 }
 
+/**
+ * Combine per-review verdicts (issue #45). Fail-closed: a blocking verdict is
+ * never outvoted into `approve`, and ties never resolve toward `approve`.
+ * - any_blocking / max_severity: most severe verdict wins (max_severity is a
+ *   documented alias — both are the same operation on verdict enums).
+ * - majority: `approve` requires a quorum (> half); otherwise the most severe
+ *   verdict on the table wins. Before this rule, ['approve','comment',
+ *   'request_changes'] resolved to `approve` and ties depended on the order
+ *   reviews happened to be declared in.
+ */
 export function combineVerdicts(
   verdicts: Verdict[],
   strategy: "any_blocking" | "max_severity" | "majority"
 ): Verdict {
   if (verdicts.length === 0) return "comment";
+  const rank: Record<Verdict, number> = { approve: 0, comment: 1, request_changes: 2 };
+  const mostSevere = () =>
+    verdicts.reduce((a, b) => (rank[b] > rank[a] ? b : a), verdicts[0]);
   if (strategy === "majority") {
-    const counts = new Map<Verdict, number>();
-    for (const v of verdicts) counts.set(v, (counts.get(v) ?? 0) + 1);
-    let best: Verdict = "comment";
-    let bestN = -1;
-    for (const [k, n] of counts) if (n > bestN) { best = k; bestN = n; }
-    return best;
+    const approvals = verdicts.filter((v) => v === "approve").length;
+    // Quorum rule: without a real majority of approvals, `approve` is unreachable.
+    if (approvals * 2 > verdicts.length) return "approve";
+    return mostSevere();
   }
-  // any_blocking + max_severity behave the same on verdict enums
-  if (verdicts.includes("request_changes")) return "request_changes";
-  if (verdicts.includes("comment")) return "comment";
-  return "approve";
+  return mostSevere();
 }
 
 type Semver = [number, number, number];

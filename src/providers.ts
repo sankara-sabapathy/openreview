@@ -160,10 +160,26 @@ export async function readBodyWithIdleTimeout(
 
 export type Usage = { in: number; out: number } | null;
 
+/** How an agent's turn ended. Only `ok`/`no-findings` mean "this agent
+ * reviewed the PR and stood by the result" — every other outcome must NOT
+ * contribute an approving ballot (issue #46). */
+export type AgentOutcome =
+  | "ok" // returned parseable findings
+  | "no-findings" // ran fine, nothing to report
+  | "skipped-no-key" // no API key for this provider
+  | "unparseable" // ran, but the response was not usable JSON
+  | "error"; // transport/auth/timeout failure (thrown, recorded by the caller)
+
+/** An outcome that legitimately votes. */
+export function countsAsReview(o: AgentOutcome): boolean {
+  return o === "ok" || o === "no-findings";
+}
+
 export type AgentResult = {
   findings: Finding[];
   usage: Usage;
   seconds: number;
+  outcome: Exclude<AgentOutcome, "error">;
 };
 
 /** Compact token counts: 12345 -> "12.3k". */
@@ -394,8 +410,10 @@ export async function runAgent(opts: {
     user += `\n\n${opts.contextBlock}\nGround every finding in the diff above; use <context> only as cross-file evidence (callers, types, contracts). Never flag context-only code.`;
   }
   const rp = resolveProvider(opts.provider, opts.keys, process.env as any, opts.sessionId);
-  // missing BYOK key -> skip silently, caller warns
-  if (!rp.apiKey) return { findings: [], usage: null, seconds: 0 };
+  // missing BYOK key -> report it as a skip so it can never read as a clean
+  // review, and the caller can name the missing secret (issue #46)
+  if (!rp.apiKey)
+    return { findings: [], usage: null, seconds: 0, outcome: "skipped-no-key" };
 
   // Retry budget (issue #30): transient empties/5xx must not silently approve.
   // Per-attempt timeout bounds hung gateway connections (the 9-minute run was
@@ -475,7 +493,7 @@ export async function runAgent(opts: {
     logWarning(
       `Agent ${opts.agentName}: could not parse findings JSON; raw head: ${raw.slice(0, 300)}`
     );
-    return { findings: [], usage, seconds };
+    return { findings: [], usage, seconds, outcome: "unparseable" };
   }
   try {
     const out: Finding[] = [];
@@ -494,13 +512,13 @@ export async function runAgent(opts: {
         provider: opts.providerName,
       });
     }
-    return { findings: out, usage, seconds };
+    return { findings: out, usage, seconds, outcome: out.length > 0 ? "ok" : "no-findings" };
   } catch (e) {
     // Validation of individual findings failed — warn, don't silently drop everything.
     logWarning(
       `Agent ${opts.agentName}: findings validation failed (${(e as Error).message}); raw head: ${raw.slice(0, 200)}`
     );
-    return { findings: [], usage, seconds };
+    return { findings: [], usage, seconds, outcome: "unparseable" };
   }
 }
 

@@ -44941,6 +44941,10 @@ async function readBodyWithIdleTimeout(res, idleMs, label, windowMs = 60000, min
     const buf = Buffer.concat(chunks.map((c) => Buffer.from(c)));
     return buf.toString("utf8");
 }
+/** An outcome that legitimately votes. */
+function countsAsReview(o) {
+    return o === "ok" || o === "no-findings";
+}
 /** Compact token counts: 12345 -> "12.3k". */
 function formatTokens(n) {
     if (n >= 1000)
@@ -45114,9 +45118,10 @@ async function runAgent(opts) {
         user += `\n\n${opts.contextBlock}\nGround every finding in the diff above; use <context> only as cross-file evidence (callers, types, contracts). Never flag context-only code.`;
     }
     const rp = resolveProvider(opts.provider, opts.keys, process.env, opts.sessionId);
-    // missing BYOK key -> skip silently, caller warns
+    // missing BYOK key -> report it as a skip so it can never read as a clean
+    // review, and the caller can name the missing secret (issue #46)
     if (!rp.apiKey)
-        return { findings: [], usage: null, seconds: 0 };
+        return { findings: [], usage: null, seconds: 0, outcome: "skipped-no-key" };
     // Retry budget (issue #30): transient empties/5xx must not silently approve.
     // Per-attempt timeout bounds hung gateway connections (the 9-minute run was
     // a single fetch hanging ~5 min with no timeout).
@@ -45193,7 +45198,7 @@ async function runAgent(opts) {
     const parsed = extractFindingsJson(raw);
     if (!parsed) {
         logWarning(`Agent ${opts.agentName}: could not parse findings JSON; raw head: ${raw.slice(0, 300)}`);
-        return { findings: [], usage, seconds };
+        return { findings: [], usage, seconds, outcome: "unparseable" };
     }
     try {
         const out = [];
@@ -45212,12 +45217,12 @@ async function runAgent(opts) {
                 provider: opts.providerName,
             });
         }
-        return { findings: out, usage, seconds };
+        return { findings: out, usage, seconds, outcome: out.length > 0 ? "ok" : "no-findings" };
     }
     catch (e) {
         // Validation of individual findings failed — warn, don't silently drop everything.
         logWarning(`Agent ${opts.agentName}: findings validation failed (${e.message}); raw head: ${raw.slice(0, 200)}`);
-        return { findings: [], usage, seconds };
+        return { findings: [], usage, seconds, outcome: "unparseable" };
     }
 }
 // Parse the findings JSON out of a model response. Tries strict parse first,
@@ -45250,16 +45255,33 @@ function matchesAny(path, patterns) {
 function matchGlob(path, pattern) {
     if (pattern === "**" || pattern === "**/**")
         return true;
-    const rx = pattern
-        .split("/")
-        .map((seg) => {
-        if (seg === "**")
-            return ".*";
-        return ("(?:" +
-            seg.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, "[^/]*") +
-            ")");
-    })
-        .join("/");
+    const segs = pattern.split("/");
+    let rx = "";
+    for (let i = 0; i < segs.length; i++) {
+        const seg = segs[i];
+        const last = i === segs.length - 1;
+        if (seg === "**") {
+            // A whole `**` segment means "zero or more path segments", so `**/*.ts`
+            // matches BOTH `main.ts` and `src/a/b.ts`. Emitting `.*` here instead
+            // required a following "/", which silently dropped every root-level file
+            // (issue #48).
+            rx += last ? ".*" : "(?:[^/]+/)*";
+            continue;
+        }
+        // Inside a segment, `**` keeps its legacy "crosses directories" meaning
+        // (`**.lock` still matches `sub/dir/x.lock`, as shipped configs rely on)
+        // and a lone `*` stays within one segment.
+        const body = seg
+            .replace(/[.+^${}()|[\]\\]/g, "\\$&")
+            // split/join (not sequential replaces): substituting `**` -> `.*` first
+            // would let the single-star pass rewrite the `*` inside that `.*`.
+            .split("**")
+            .map((part) => part.replace(/\*/g, "[^/]*"))
+            .join(".*");
+        rx += `(?:${body})`;
+        if (!last)
+            rx += "/";
+    }
     return new RegExp(`^${rx}$`).test(path);
 }
 function filterIgnored(files, ignore) {
@@ -45309,28 +45331,29 @@ function decideReviewVerdict(mode, minSeverity, findings) {
         return "approve";
     return mode;
 }
+/**
+ * Combine per-review verdicts (issue #45). Fail-closed: a blocking verdict is
+ * never outvoted into `approve`, and ties never resolve toward `approve`.
+ * - any_blocking / max_severity: most severe verdict wins (max_severity is a
+ *   documented alias — both are the same operation on verdict enums).
+ * - majority: `approve` requires a quorum (> half); otherwise the most severe
+ *   verdict on the table wins. Before this rule, ['approve','comment',
+ *   'request_changes'] resolved to `approve` and ties depended on the order
+ *   reviews happened to be declared in.
+ */
 function combineVerdicts(verdicts, strategy) {
     if (verdicts.length === 0)
         return "comment";
+    const rank = { approve: 0, comment: 1, request_changes: 2 };
+    const mostSevere = () => verdicts.reduce((a, b) => (rank[b] > rank[a] ? b : a), verdicts[0]);
     if (strategy === "majority") {
-        const counts = new Map();
-        for (const v of verdicts)
-            counts.set(v, (counts.get(v) ?? 0) + 1);
-        let best = "comment";
-        let bestN = -1;
-        for (const [k, n] of counts)
-            if (n > bestN) {
-                best = k;
-                bestN = n;
-            }
-        return best;
+        const approvals = verdicts.filter((v) => v === "approve").length;
+        // Quorum rule: without a real majority of approvals, `approve` is unreachable.
+        if (approvals * 2 > verdicts.length)
+            return "approve";
+        return mostSevere();
     }
-    // any_blocking + max_severity behave the same on verdict enums
-    if (verdicts.includes("request_changes"))
-        return "request_changes";
-    if (verdicts.includes("comment"))
-        return "comment";
-    return "approve";
+    return mostSevere();
 }
 function parseSemver(s) {
     const m = /^v?(\d+)\.(\d+)\.(\d+)(?:[-+].*)?$/.exec(s.trim());
@@ -45413,19 +45436,43 @@ function logoUrl() {
     const { repo, ref } = actionBase();
     return `https://raw.githubusercontent.com/${repo}/${ref}/assets/logo.svg`;
 }
+const OUTCOME_LABEL = {
+    ok: "✅ reviewed",
+    "no-findings": "✅ no findings",
+    "skipped-no-key": "⏭️ skipped (no key)",
+    unparseable: "⚠️ unusable response",
+    error: "❌ failed",
+};
 function renderStickyBody(opts) {
+    const status = opts.status ?? "ok";
     const lines = [];
     lines.push(STICKY_MARKER);
     lines.push(`<img src="${logoUrl()}" width="28" height="28" align="left" alt="OpenReview AI" />`);
-    lines.push(`## OpenReview AI — ${opts.verdict.replace(/_/g, " ").toUpperCase()}`);
+    // Fail loud: a run where nothing was reviewed must never read as a pass
+    // (issue #46). "APPROVE / No actionable findings. Nice work." was printed for
+    // runs where every agent had errored.
+    lines.push(status === "error"
+        ? `## OpenReview AI — REVIEW FAILED`
+        : `## OpenReview AI — ${opts.verdict.replace(/_/g, " ").toUpperCase()}`);
     lines.push("");
     lines.push("<br />");
     lines.push("");
+    if (status === "partial") {
+        const failed = opts.perReview.filter((r) => r.counted === false).map((r) => r.id);
+        lines.push(`> ⚠️ **Partial review** — ${failed.map((i) => `\`${i}\``).join(", ")} produced no usable result and did not vote.`);
+        lines.push("");
+    }
     for (const r of opts.perReview)
-        lines.push(`- \`${r.id}\`: **${r.verdict}** (${r.count} findings)`);
+        lines.push(`- \`${r.id}\`: **${r.counted === false ? "not reviewed" : r.verdict}** (${r.count} findings)`);
     lines.push("");
+    if (status === "error") {
+        lines.push("**No review completed.** The verdict below is not a pass — see the agent results.");
+        lines.push("");
+    }
     if (opts.findings.length === 0) {
-        lines.push("No actionable findings. Nice work.");
+        lines.push(status === "ok"
+            ? "No actionable findings. Nice work."
+            : "No findings were produced (the run did not complete cleanly).");
     }
     else {
         lines.push("| Severity | File | Finding | Agent |");
@@ -45437,6 +45484,20 @@ function renderStickyBody(opts) {
         }
         if (opts.findings.length > 50)
             lines.push(`\n… and ${opts.findings.length - 50} more (see inline comments).`);
+    }
+    const agents = opts.agents ?? [];
+    const rough = agents.filter((a) => a.outcome !== "ok" && a.outcome !== "no-findings");
+    if (agents.length > 0) {
+        lines.push("");
+        lines.push(`<details><summary>🤖 ${agents.length} agent(s)${rough.length ? ` — ${rough.length} not clean` : ""}</summary>`);
+        lines.push("");
+        lines.push("| Agent | Provider | Outcome | Time |");
+        lines.push("|---|---|---|---|");
+        for (const a of agents) {
+            lines.push(`| ${a.agent} | ${a.provider} | ${OUTCOME_LABEL[a.outcome] ?? a.outcome} | ${a.seconds.toFixed(1)}s |`);
+        }
+        lines.push("");
+        lines.push("</details>");
     }
     if (opts.runUrl)
         lines.push(`\n<sub>Run: ${opts.runUrl}</sub>`);
@@ -46017,6 +46078,7 @@ async function run() {
                     findings: result.findings,
                     usage: result.usage,
                     seconds: result.seconds,
+                    outcome: result.outcome,
                     agent: a.name ?? "agent",
                     providerName: a.provider,
                 }))
@@ -46028,6 +46090,7 @@ async function run() {
                         usage: null,
                         seconds: 0,
                         error: msg,
+                        outcome: "error",
                         agent: a.name ?? "agent",
                         providerName: a.provider,
                     };
@@ -46052,7 +46115,13 @@ async function run() {
             }
             findings.sort((a, b) => ({ high: 0, medium: 1, suggestion: 2 }[a.severity] -
                 { high: 0, medium: 1, suggestion: 2 }[b.severity]));
+            // Fail closed (issue #46): a review whose every agent was skipped or
+            // errored contributed NO usable signal, so it must not cast an approving
+            // ballot — "no findings because nothing ran" is not "no findings found".
+            const counted = results.filter((r) => countsAsReview(r.outcome)).length;
             const verdict = (() => {
+                if (counted === 0)
+                    return "approve"; // placeholder, excluded below
                 // One ballot per distinct provider (issue #12). `any` reproduces the
                 // old pooled behavior exactly; `all`/`majority` resolve disagreement.
                 const byProvider = new Map();
@@ -46073,6 +46142,13 @@ async function run() {
                 verdict,
                 findings,
                 errors: agentErrors,
+                counted: counted > 0,
+                agents: results.map((r) => ({
+                    agent: r.agent,
+                    providerName: r.providerName,
+                    outcome: r.outcome,
+                    seconds: r.seconds,
+                })),
                 usage: results
                     .filter((r) => r.usage)
                     .map((r) => ({
@@ -46082,19 +46158,50 @@ async function run() {
                     seconds: r.seconds,
                 })),
             });
-            logInfo(`Review ${review.id}: ${findings.length} findings -> ${verdict}`);
+            if (counted === 0) {
+                logWarning(`Review ${review.id}: ${results.length} agent(s), none reviewed (no usable result) — ` +
+                    `excluded from the verdict.`);
+            }
+            logInfo(`Review ${review.id}: ${findings.length} findings -> ${verdict}${counted > 0 ? "" : " (excluded)"}`);
         }
-        const global = combineVerdicts(perReview.map((r) => r.verdict), config.global_verdict.strategy);
+        if (perReview.length === 0) {
+            logInfo("No review matched any path in the diff; nothing to do.");
+            return;
+        }
+        // Only reviews that actually ran vote; a run where nothing did is reported
+        // as `error` and can never come out as approve (issue #46).
+        const countedReviews = perReview.filter((r) => r.counted);
+        const global = combineVerdicts(countedReviews.map((r) => r.verdict), config.global_verdict.strategy);
+        const status = countedReviews.length === 0
+            ? "error"
+            : countedReviews.length < perReview.length
+                ? "partial"
+                : "ok";
         const all = perReview.flatMap((r) => r.findings);
         core.setOutput("verdict", global);
+        core.setOutput("review_status", status);
         const runUrl = `${process.env.GITHUB_SERVER_URL ?? "https://github.com"}/${owner}/${repo}/actions/runs/${process.env.GITHUB_RUN_ID ?? ""}`;
         const stickyBase = renderStickyBody({
             verdict: global,
-            perReview: perReview.map((r) => ({ id: r.id, verdict: r.verdict, count: r.findings.length })),
+            status,
+            perReview: perReview.map((r) => ({
+                id: r.id,
+                verdict: r.verdict,
+                count: r.findings.length,
+                counted: r.counted,
+            })),
+            agents: perReview.flatMap((r) => r.agents.map((a) => ({
+                ...a,
+                provider: a.providerName,
+                review: r.id,
+            }))),
             findings: all,
             runUrl,
         });
-        const hasAnyKey = Boolean(keys.anthropicApiKey || keys.openaiApiKey || keys.opencodeApiKey);
+        // Derived from actual agent outcomes, not from a hardcoded list of three
+        // env var names — a config using key_from: env.GROQ_API_KEY used to be told
+        // "No provider API keys configured" on a fully successful run (issue #49).
+        const skippedNoKey = perReview.flatMap((r) => r.agents).filter((a) => a.outcome === "skipped-no-key");
         const allErrors = perReview.flatMap((r) => r.errors);
         // Consolidated usage, grouped by model: "model 12.3k/1.1k 38t/s".
         const usageByModel = new Map();
@@ -46116,14 +46223,21 @@ async function run() {
             sticky += `\n<sub>Models: ${usageLine}</sub>`;
             logInfo(`Usage: ${usageLine}`);
         }
-        if (!hasAnyKey) {
-            sticky += `\n\n> ⚠️ No provider API keys configured — agents were skipped. Add \`ANTHROPIC_API_KEY\`, \`OPENAI_API_KEY\`, or \`OPENCODE_API_KEY\` as repo Actions secrets (only the ones your \`providers{}\` use).`;
+        if (skippedNoKey.length > 0) {
+            const names = [...new Set(skippedNoKey.map((a) => a.agent))].map((a) => `\`${a}\``).join(", ");
+            sticky +=
+                `\n\n> ⚠️ ${skippedNoKey.length} agent(s) skipped — no API key for their provider: ${names}. ` +
+                    `Add the secret each provider's \`key_from\` names (see \`.github/openreview.yml\`).`;
+            logWarning(`${skippedNoKey.length} agent(s) skipped for a missing API key: ${names}`);
         }
-        else if (all.length === 0 && allErrors.length > 0) {
-            sticky += `\n\n<details><summary>⚠️ All agents failed — details</summary>\n\n${allErrors.join("\n")}\n\nCheck model IDs and base URLs against provider docs.</details>`;
+        if (allErrors.length > 0) {
+            const scope = status === "error"
+                ? "⚠️ All agents failed — no review completed"
+                : `⚠️ ${allErrors.length} agent error(s)`;
+            sticky += `\n\n<details><summary>${scope} — details</summary>\n\n${allErrors.join("\n")}\n\nCheck model IDs and base URLs against the provider docs. Secrets are never logged.</details>`;
         }
         if (dryRun) {
-            logInfo(`DRY RUN verdict=${global}\n${sticky.slice(0, 2000)}`);
+            logInfo(`DRY RUN verdict=${global} status=${status}\n${sticky.slice(0, 2000)}`);
             return;
         }
         if (config.global_verdict.sticky_comment) {
