@@ -44,24 +44,47 @@ function truncate(s: string, n: number): string {
   return s.length > n ? s.slice(0, n) + "\n...[truncated]" : s;
 }
 
-/** Read a response body with an idle watchdog: any 90s window without a single
- * byte kills the request. Slow-but-streaming gateways survive; dead hangs die
- * fast. Total cap is enforced separately by the caller's AbortController. */
-async function readBodyWithIdleTimeout(
+/** Read a response body with two watchdogs (issue #41):
+ * - idle: any `idleMs` window without a single byte kills the request;
+ * - throughput: any rolling `windowMs` delivering fewer than `minWindowBytes`
+ *   kills it (trickling streams that defeat the idle check).
+ * Slow-but-producing gateways survive both; dead hangs and trickles die fast.
+ * Total cap is enforced separately by the caller's AbortController. Exported
+ * for unit tests (feed it a real Response from a local trickle server). */
+export async function readBodyWithIdleTimeout(
   res: Response,
   idleMs: number,
-  label: string
+  label: string,
+  windowMs = 60000,
+  minWindowBytes = 1024
 ): Promise<string> {
   const body = res.body;
   if (!body) return res.text();
   const reader = body.getReader();
   const chunks: Uint8Array[] = [];
   let received = 0;
+  let windowStart = Date.now();
+  let windowBytes = 0;
+  let idleFired = false;
   const fail = () => {
+    // NOTE: cancel() resolves (not rejects) the pending read as done:true,
+    // so record the flag and raise the idle error explicitly below.
+    idleFired = true;
     try {
       reader.cancel();
     } catch {
       // ignore
+    }
+  };
+  const checkWindow = (now: number) => {
+    if (now - windowStart >= windowMs) {
+      if (windowBytes < minWindowBytes) {
+        throw new Error(
+          `${label}: trickle timeout (only ${windowBytes}B in the last ${windowMs / 1000}s, ${received}B total)`
+        );
+      }
+      windowStart = now;
+      windowBytes = 0;
     }
   };
   try {
@@ -73,11 +96,19 @@ async function readBodyWithIdleTimeout(
       } finally {
         clearTimeout(timer);
       }
+      if (idleFired) {
+        throw new Error(
+          `${label}: idle timeout (no bytes for ${idleMs / 1000}s, got ${received} so far)`
+        );
+      }
       if (read.done) break;
       received += read.value.byteLength;
+      windowBytes += read.value.byteLength;
+      checkWindow(Date.now());
       chunks.push(read.value);
     }
   } catch (e) {
+    if ((e as Error).message.includes("trickle timeout")) throw e;
     throw new Error(`${label}: idle timeout (no bytes for ${idleMs / 1000}s, got ${received} so far)`);
   }
   const buf = Buffer.concat(chunks.map((c) => Buffer.from(c)));
@@ -292,9 +323,12 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-/** Retryable: empty responses, timeouts, HTTP 429/5xx, transport failures. Never 4xx auth/shape errors. */
+/** Retryable: empty responses, timeouts (idle/trickle/total), HTTP 429/5xx,
+ * transport failures. Never 4xx auth/shape errors.
+ * Note: undici fires its own ~300s body timeout first, so our total cap only
+ * matters below that; the idle + trickle guards are the real protection. */
 export function isRetryableError(message: string): boolean {
-  return /empty (content|response)|timeout after| 429[:\s]| 5\d\d[:\s]|fetch failed|timeout|ECONNRESET|ENOTFOUND|socket hang up/i.test(
+  return /empty (content|response)|timeout after|idle timeout|trickle timeout| 429[:\s]| 5\d\d[:\s]|fetch failed|timeout|ECONNRESET|ENOTFOUND|socket hang up/i.test(
     message
   );
 }

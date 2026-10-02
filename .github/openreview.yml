@@ -40,7 +40,7 @@ providers:
     # json_mode: true # set false for providers rejecting response_format
     # extra_body: { temperature: 0.1 } # extra JSON body fields merged into requests
     # retries: 2 # attempts after the first for empty/5xx/429/network (0-5)
-    # timeout_s: 420 # per-attempt TOTAL cap in seconds (10-600); 90s idle watchdog always on
+    # timeout_s: 420 # per-attempt TOTAL cap in seconds (10-600); 90s idle + 60s/1KB trickle guards always on
 
   # --- Commented examples: any provider works with protocol + base_url + key_from + model ---
   # Claude subscription (Pro/Max/…): `claude setup-token` → secret → step env.

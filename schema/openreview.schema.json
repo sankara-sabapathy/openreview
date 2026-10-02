@@ -54,7 +54,7 @@
           "endpoint_path": { "type": "string" },
           "json_mode": { "type": "boolean" },
           "retries": { "type": "integer", "minimum": 0, "maximum": 5 },
-          "timeout_s": { "type": "integer", "minimum": 10, "maximum": 600, "description": "Per-attempt total cap in seconds (default 420); a 90s idle watchdog kills dead hangs regardless." },
+          "timeout_s": { "type": "integer", "minimum": 10, "maximum": 600, "description": "Per-attempt total cap in seconds (default 420); 90s idle + 60s/1KB trickle guards kill dead hangs regardless." },
           "extra_body": { "type": "object" }
         }
       }

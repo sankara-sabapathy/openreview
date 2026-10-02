@@ -44520,8 +44520,9 @@ const ProviderConfig = objectType({
     // Total failure throws into the PR's agent-error block instead of silent empty.
     retries: numberType().int().min(0).max(5).default(2),
     // Per-attempt HTTP timeout in seconds (default 420, max 600). This is a TOTAL
-    // cap; an always-on 90s idle watchdog kills dead hangs fast while slow but
-    // streaming responses survive to the cap. Worst case ≈ attempts × timeout_s.
+    // cap; an always-on 90s idle watchdog kills dead hangs fast, and a 60s/1KB
+    // trickle guard kills slow-drip streams, while producing responses survive
+    // to the cap. Worst case ≈ attempts × timeout_s.
     timeout_s: numberType().int().min(10).max(600).default(420),
     // Send response_format json_object (openai-chat). Disable for providers that reject it.
     json_mode: booleanType().default(true),
@@ -44831,22 +44832,41 @@ const SYSTEM_WRAPPER = (lang, instructions) => `You are a senior code reviewer. 
 function truncate(s, n) {
     return s.length > n ? s.slice(0, n) + "\n...[truncated]" : s;
 }
-/** Read a response body with an idle watchdog: any 90s window without a single
- * byte kills the request. Slow-but-streaming gateways survive; dead hangs die
- * fast. Total cap is enforced separately by the caller's AbortController. */
-async function readBodyWithIdleTimeout(res, idleMs, label) {
+/** Read a response body with two watchdogs (issue #41):
+ * - idle: any `idleMs` window without a single byte kills the request;
+ * - throughput: any rolling `windowMs` delivering fewer than `minWindowBytes`
+ *   kills it (trickling streams that defeat the idle check).
+ * Slow-but-producing gateways survive both; dead hangs and trickles die fast.
+ * Total cap is enforced separately by the caller's AbortController. Exported
+ * for unit tests (feed it a real Response from a local trickle server). */
+async function readBodyWithIdleTimeout(res, idleMs, label, windowMs = 60000, minWindowBytes = 1024) {
     const body = res.body;
     if (!body)
         return res.text();
     const reader = body.getReader();
     const chunks = [];
     let received = 0;
+    let windowStart = Date.now();
+    let windowBytes = 0;
+    let idleFired = false;
     const fail = () => {
+        // NOTE: cancel() resolves (not rejects) the pending read as done:true,
+        // so record the flag and raise the idle error explicitly below.
+        idleFired = true;
         try {
             reader.cancel();
         }
         catch {
             // ignore
+        }
+    };
+    const checkWindow = (now) => {
+        if (now - windowStart >= windowMs) {
+            if (windowBytes < minWindowBytes) {
+                throw new Error(`${label}: trickle timeout (only ${windowBytes}B in the last ${windowMs / 1000}s, ${received}B total)`);
+            }
+            windowStart = now;
+            windowBytes = 0;
         }
     };
     try {
@@ -44859,13 +44879,20 @@ async function readBodyWithIdleTimeout(res, idleMs, label) {
             finally {
                 clearTimeout(timer);
             }
+            if (idleFired) {
+                throw new Error(`${label}: idle timeout (no bytes for ${idleMs / 1000}s, got ${received} so far)`);
+            }
             if (read.done)
                 break;
             received += read.value.byteLength;
+            windowBytes += read.value.byteLength;
+            checkWindow(Date.now());
             chunks.push(read.value);
         }
     }
     catch (e) {
+        if (e.message.includes("trickle timeout"))
+            throw e;
         throw new Error(`${label}: idle timeout (no bytes for ${idleMs / 1000}s, got ${received} so far)`);
     }
     const buf = Buffer.concat(chunks.map((c) => Buffer.from(c)));
@@ -45030,9 +45057,12 @@ function resolveProvider(provider, keys, env, sessionId) {
 function sleep(ms) {
     return new Promise((resolve) => setTimeout(resolve, ms));
 }
-/** Retryable: empty responses, timeouts, HTTP 429/5xx, transport failures. Never 4xx auth/shape errors. */
+/** Retryable: empty responses, timeouts (idle/trickle/total), HTTP 429/5xx,
+ * transport failures. Never 4xx auth/shape errors.
+ * Note: undici fires its own ~300s body timeout first, so our total cap only
+ * matters below that; the idle + trickle guards are the real protection. */
 function isRetryableError(message) {
-    return /empty (content|response)|timeout after| 429[:\s]| 5\d\d[:\s]|fetch failed|timeout|ECONNRESET|ENOTFOUND|socket hang up/i.test(message);
+    return /empty (content|response)|timeout after|idle timeout|trickle timeout| 429[:\s]| 5\d\d[:\s]|fetch failed|timeout|ECONNRESET|ENOTFOUND|socket hang up/i.test(message);
 }
 async function runAgent(opts) {
     const system = SYSTEM_WRAPPER(opts.lang, opts.instructions);
