@@ -81,8 +81,16 @@ lane; verify every snippet against the code before committing.
 ## Test loop
 
 - `npm run typecheck && npm run build && node dist-src/validate.js openreview.example.yml`
+- **PR reviews run the branch, not the release.** `.github/workflows/ai-review.yml`
+  uses `uses: ./` while a PR is open, so the dogfood review exercises the
+  change being proposed (with `@v1` it always reviews the last release, so a
+  fix PR is "reviewed" by the code it is fixing). The **final commit before
+  merge** restores `uses: sankara-sabapathy/openreview@v1`. `uses: ./` needs
+  `dist/` committed and fresh, which CI already enforces.
 - Live dogfood: push to `main`, move `v1` after release, open a **temporary** PR with
   a buggy fixture file, verify sticky + inline comments, then close unmerged and
   delete the branch. Each run spends real provider budget — one verification PR per
   behavior change, not per commit.
+- The dogfood review can take 10+ min and is advisory: `ci.yml` (`build`) is the
+  merge gate. Treat a `review` failure as "no signal", not "no opinion".
 - Commit style: Conventional Commits (`feat:`/`fix:` release; `docs:`/`chore:` don't).

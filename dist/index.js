@@ -45442,8 +45442,17 @@ function actionBase() {
     // Prefer the action's own coordinates so forks/renames keep working; the
     // hardcoded default matches this repo's published location.
     const repo = process.env.GITHUB_ACTION_REPOSITORY || "sankara-sabapathy/openreview";
-    const ref = process.env.GITHUB_ACTION_REF || "v1";
-    return { repo, ref };
+    const ref = process.env.GITHUB_ACTION_REF || "";
+    // With `uses: ./` (how PRs dogfood unreleased changes) GITHUB_ACTION_REF is the
+    // checkout ref — `refs/pull/62/merge` — which raw.githubusercontent cannot
+    // serve, so the logo would 404 in every comment. Prefer the PR's head branch,
+    // then any plain branch/tag, and fall back to the default branch.
+    const head = process.env.GITHUB_HEAD_REF || "";
+    if (head && !head.includes("..") && !/[~^:\\]|\s/.test(head))
+        return { repo, ref: head };
+    if (/^[\w.\-/]+$/.test(ref) && !ref.startsWith("refs/"))
+        return { repo, ref };
+    return { repo, ref: "main" };
 }
 function logoUrl() {
     const { repo, ref } = actionBase();
