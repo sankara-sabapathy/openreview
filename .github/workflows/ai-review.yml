@@ -10,12 +10,6 @@ permissions:
   issues: write
   contents: read
 
-# One review per PR at a time; a queued trigger waits instead of stacking runs
-# (and burning provider budget) on top of each other.
-concurrency:
-  group: openreview-${{ github.event.pull_request.number || github.event.issue.number || github.run_id }}
-  cancel-in-progress: false
-
 jobs:
   review:
     # issue_comment runs in the BASE repo, so the secrets are live: gate the
