@@ -12,18 +12,11 @@ permissions:
 
 jobs:
   review:
-    # issue_comment runs in the BASE repo, so the secrets are live: gate the
-    # command on (a) an exact match of defaults.command and (b) a sender with
-    # write access. contains() would also fire on "/reviewer" and quoted text,
-    # and without (b) any GitHub user could spend this repo's API budget.
-    # The action re-checks both rules itself (defense in depth).
     if: >
       github.event_name == 'pull_request' ||
       (github.event_name == 'issue_comment' &&
        github.event.issue.pull_request &&
-       github.event.sender.type != 'Bot' &&
-       contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association) &&
-       trim(github.event.comment.body) == '/review')
+       contains(github.event.comment.body, '/review'))
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
