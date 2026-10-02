@@ -5,20 +5,14 @@ import { readBodyWithIdleTimeout, isRetryableError } from "./providers.js";
 
 function serve(
   handler: (req: unknown, res: { writeHead: Function; write: Function; end: Function; flushHeaders: Function }) => void
-): Promise<{ url: string; close: () => void; openSockets: () => number }> {
+): Promise<{ url: string; close: () => void }> {
   return new Promise((resolve) => {
     const server = createServer(handler as never);
-    let open = 0;
-    server.on("connection", (s) => {
-      open++;
-      s.on("close", () => open--);
-    });
     server.listen(0, "127.0.0.1", () => {
       const addr = server.address();
       const port = typeof addr === "object" && addr ? addr.port : 0;
       resolve({
         url: `http://127.0.0.1:${port}/`,
-        openSockets: () => open,
         close: () => {
           // Destroy open sockets first: idle/trickle tests leave connections
           // hanging by design, and close() alone waits for them forever.
@@ -135,51 +129,49 @@ describe("readBodyWithIdleTimeout", () => {
     }
   });
 
-  it("releases the socket when the trickle guard fires", async () => {
-    // The trickle throw skips the idle watchdog's reader.cancel(), which used to
-    // hold the connection until the caller's total cap aborted it.
-    let open = 0;
-    const { url, close, openSockets } = await serve((_req, res) => {
-      res.writeHead(200, { "content-type": "application/json" });
-      res.flushHeaders();
-      const timer = setInterval(() => {
-        try {
-          res.write("x");
-        } catch {
-          clearInterval(timer);
-        }
-      }, 100);
-      setTimeout(() => {
-        clearInterval(timer);
-        try {
-          res.end();
-        } catch {
-          // ignore
-        }
-      }, 5000).unref?.();
+  it("cancels the reader when the trickle guard fires", async () => {
+    // The trickle throw used to skip the idle watchdog's reader.cancel(),
+    // holding the connection until the caller's total cap aborted it (up to
+    // timeout_s later, once per retry). Asserting on a real socket's close
+    // event proved timing-dependent on loaded CI runners, so assert the
+    // contract directly: the body stream must be cancelled.
+    let cancelled = false;
+    let timer: ReturnType<typeof setInterval> | undefined;
+    const stream = new ReadableStream<Uint8Array>({
+      start(c) {
+        // Keep trickling: the guard is only re-evaluated when a chunk
+        // arrives, so a stream that then goes silent is the idle watchdog's
+        // job (that is the case the next test covers).
+        c.enqueue(new Uint8Array([120]));
+        timer = setInterval(() => c.enqueue(new Uint8Array([120])), 15);
+      },
+      cancel() {
+        cancelled = true;
+        if (timer) clearInterval(timer);
+      },
     });
-    open = openSockets();
-    try {
-      await assert.rejects(
-        readBodyWithIdleTimeout(
-          await fetch(url, { headers: { connection: "close" } }),
-          3000,
-          "t",
-          500,
-          100000
-        ),
-        /trickle timeout/
-      );
-      // The cancel is async and the server-side close event lags it, so poll
-      // for eventual release instead of asserting at a fixed instant.
-      const deadline = Date.now() + 5000;
-      while (openSockets() > 0 && Date.now() < deadline) {
-        await new Promise((r) => setTimeout(r, 50));
-      }
-      assert.equal(openSockets(), 0, "trickle path must release the socket");
-    } finally {
-      close();
-    }
+    const res = new Response(stream, { status: 200 });
+    // windowMs 10ms / grace 10ms / threshold 100KB -> trips, then goes fatal.
+    await assert.rejects(
+      readBodyWithIdleTimeout(res, 1000, "t", 10, 100000, 10),
+      /trickle timeout/
+    );
+    assert.ok(cancelled, "trickle path must cancel the body stream");
+  });
+
+  it("cancels the reader when the idle watchdog fires", async () => {
+    let cancelled = false;
+    const stream = new ReadableStream<Uint8Array>({
+      start() {
+        /* headers, then silence */
+      },
+      cancel() {
+        cancelled = true;
+      },
+    });
+    const res = new Response(stream, { status: 200 });
+    await assert.rejects(readBodyWithIdleTimeout(res, 60, "t"), /idle timeout/);
+    assert.ok(cancelled, "idle path must cancel the body stream");
   });
 
   it("lets a slow-but-producing stream through", async () => {
