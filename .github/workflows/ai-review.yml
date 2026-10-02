@@ -32,12 +32,10 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      # TEMPORARY (PR convention, see AGENTS.md): review PRs with the code in
-      # this branch, not the last release. The final commit before merge
-      # restores the released tag:
-      #   uses: sankara-sabapathy/openreview@v1
-      # `uses: ./` requires dist/ to be committed and fresh (it is, per CI).
-      - uses: ./
+      # Final commit before merge: back to the published action (AGENTS.md
+      # convention). The previous commit used `uses: ./` so the dogfood review
+      # exercised this branch instead of the last release.
+      - uses: sankara-sabapathy/openreview@v1
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           config-path: .github/openreview.yml
