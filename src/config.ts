@@ -109,6 +109,13 @@ export const OpenReviewConfig = z.object({
       lang: z.string().default("en"),
       ignore: z.array(z.string()).default([]),
       max_diff_chars: z.number().int().positive().default(80000),
+      // Wall-clock budget for the whole run (issue #51). Once exhausted, no new
+      // agent call starts and remaining agents report `budget-exhausted`.
+      // Worst case was reviews x agents x (1+retries) x timeout_s (~42 min).
+      max_runtime_s: z.number().int().min(30).max(14400).default(1200),
+      // Max agents in flight per review. Unbounded fan-out rate-limits small
+      // providers and turns retries into a 429 storm.
+      max_concurrency: z.number().int().min(1).max(32).default(4),
       max_context_chars: z.number().int().nonnegative().default(20000),
       include_full_files: z.boolean().default(true),
       // Noise defaults (issue #21). Severity stays owned by verdict.min_severity.

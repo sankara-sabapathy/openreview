@@ -28,6 +28,7 @@ const OUTCOME_LABEL: Record<string, string> = {
   ok: "✅ reviewed",
   "no-findings": "✅ no findings",
   "skipped-no-key": "⏭️ skipped (no key)",
+  "budget-exhausted": "⏱️ skipped (run budget)",
   unparseable: "⚠️ unusable response",
   error: "❌ failed",
 };

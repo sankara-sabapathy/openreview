@@ -16,6 +16,8 @@ defaults:
   lang: en
   ignore: ["**.lock", "dist/**", "*.snap", "package-lock.json"]
   max_diff_chars: 80000
+  max_runtime_s: 1200 # wall-clock budget for the whole run (30-14400)
+  max_concurrency: 4 # agents in flight per review (1-32)
 
 providers:
   claude:

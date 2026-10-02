@@ -24,6 +24,8 @@
         "lang": { "type": "string" },
         "ignore": { "type": "array", "items": { "type": "string" } },
         "max_diff_chars": { "type": "integer", "minimum": 1000 },
+        "max_runtime_s": { "type": "integer", "minimum": 30, "maximum": 14400, "description": "Wall-clock budget for the whole run, seconds (default 1200)." },
+        "max_concurrency": { "type": "integer", "minimum": 1, "maximum": 32, "description": "Max agents in flight per review (default 4)." },
         "max_context_chars": { "type": "integer", "minimum": 0 },
         "include_full_files": { "type": "boolean" },
         "profile": { "enum": ["quiet", "balanced", "assertive"] },

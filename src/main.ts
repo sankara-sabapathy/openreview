@@ -69,6 +69,25 @@ async function getPrDiff(octokit: ReturnType<typeof github.getOctokit>, owner: s
   return { fileNames: names, diff: parts.join("\n\n"), headSha: pull.head.sha };
 }
 
+/** Run thunks with at most `limit` in flight, preserving result order.
+ * Takes thunks, NOT promises: an already-started promise is in flight before
+ * the pool can see it, so passing promises caps nothing. */
+export async function runPooled<T>(thunks: (() => Promise<T>)[], limit: number): Promise<T[]> {
+  if (thunks.length === 0) return [];
+  const cap = Math.max(1, Math.min(limit, thunks.length));
+  const out: T[] = new Array(thunks.length);
+  let next = 0;
+  const worker = async () => {
+    for (;;) {
+      const i = next++;
+      if (i >= thunks.length) return;
+      out[i] = await thunks[i]();
+    }
+  };
+  await Promise.all(Array.from({ length: cap }, worker));
+  return out;
+}
+
 export async function run(): Promise<void> {
   try {
     initLogger();
@@ -117,6 +136,22 @@ export async function run(): Promise<void> {
       logWarning(`Trigger denied: ${gate.reason}. Nothing was reviewed or posted.`);
       return;
     }
+    // Run-wide wall-clock budget (issue #51). Every agent call clamps its own
+    // timeout to what is left, and `runAgent` refuses to start once it is gone.
+    const maxRuntimeS = config.defaults.max_runtime_s ?? 1200;
+    const maxConcurrency = config.defaults.max_concurrency ?? 4;
+    const deadlineAt = Date.now() + maxRuntimeS * 1000;
+    logInfo(
+      `Run budget: ${maxRuntimeS}s total, ${maxConcurrency} agent(s) in flight per review` +
+        (config.reviews.length > 1
+          ? `; projected worst case ~${Math.ceil(
+              (config.reviews.length *
+                config.reviews.reduce((n, r) => n + 1 + r.subagents.length, 0) *
+                ((config.reviews[0].main ? 3 : 0) + 1)) /
+                60
+            )} min without the budget kicking in`
+          : "")
+    );
     // Stable session per workflow run (required by OpenCode Go/Zen routing).
     const sessionId =
       process.env.GITHUB_RUN_ID ?? `${Date.now()}-${Math.random().toString(36).slice(2)}`;
@@ -166,7 +201,9 @@ export async function run(): Promise<void> {
           review.max_context_chars ?? config.defaults.max_context_chars ?? 20000,
         ignore: config.defaults.ignore ?? [],
       });
-      const tasks: Promise<{
+      // Thunks, not promises: runAgent must not start until the pool allows it
+      // (an eager promise is already in flight, so the cap would be a no-op).
+      const tasks: (() => Promise<{
         findings: Finding[];
         usage: { in: number; out: number } | null;
         seconds: number;
@@ -174,7 +211,7 @@ export async function run(): Promise<void> {
         outcome: AgentOutcome;
         agent: string;
         providerName: string;
-      }>[] = [];
+      }>)[] = [];
       const agentDefs = [
         { ...review.main, name: review.main.name ?? `${review.id}:main` },
         ...review.subagents.map((s, i) => ({ ...s, name: s.name ?? `${review.id}:sub${i}` })),
@@ -190,7 +227,7 @@ export async function run(): Promise<void> {
           logWarning(`Review ${review.id}: unknown provider '${a.provider}', skipped agent ${a.name}.`);
           continue;
         }
-        tasks.push(
+        tasks.push(() =>
           runAgent({
             agentName: a.name ?? "agent",
             providerName: a.provider,
@@ -202,6 +239,7 @@ export async function run(): Promise<void> {
             maxDiffChars: config.defaults.max_diff_chars ?? 80000,
             sessionId,
             contextBlock,
+            deadlineAt,
           })
             .then((result) => ({
               findings: result.findings,
@@ -226,7 +264,10 @@ export async function run(): Promise<void> {
             })
         );
       }
-      const results = await Promise.all(tasks);
+      // Bounded fan-out (issue #51): run at most `max_concurrency` agents at a
+      // time instead of bursting every agent at the provider at once. The
+      // thunk is what makes the cap real — see runPooled.
+      const results = await runPooled(tasks, maxConcurrency);
       let findings = results.flatMap((r) => r.findings);
       const agentErrors = results.filter((r) => r.error).map((r) => `- \`${r.agent}\`: ${r.error}`);
       if (review.verdict.deduplicate) findings = dedupeFindings(findings);

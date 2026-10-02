@@ -22,6 +22,13 @@ defaults:
   lang: en
   ignore: ["**.lock", "dist/**", "website/build/**"]
   max_diff_chars: 80000
+  # Wall-clock budget for the whole run (30-14400, default 1200). Once spent, no
+  # new agent call starts and the rest report `budget-exhausted` instead of
+  # voting. Worst case used to be reviews x agents x (1+retries) x timeout_s.
+  max_runtime_s: 1200
+  # Agents in flight per review (1-32, default 4). Unbounded fan-out rate-limits
+  # small providers and turns a retry wave into a 429 storm.
+  max_concurrency: 4
 
 providers:
   # --- Active: OpenCode Go (deepseek-v4-flash: reliable live, 8 findings on

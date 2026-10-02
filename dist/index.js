@@ -44576,6 +44576,13 @@ const OpenReviewConfig = objectType({
         lang: stringType().default("en"),
         ignore: arrayType(stringType()).default([]),
         max_diff_chars: numberType().int().positive().default(80000),
+        // Wall-clock budget for the whole run (issue #51). Once exhausted, no new
+        // agent call starts and remaining agents report `budget-exhausted`.
+        // Worst case was reviews x agents x (1+retries) x timeout_s (~42 min).
+        max_runtime_s: numberType().int().min(30).max(14400).default(1200),
+        // Max agents in flight per review. Unbounded fan-out rate-limits small
+        // providers and turns retries into a 429 storm.
+        max_concurrency: numberType().int().min(1).max(32).default(4),
         max_context_chars: numberType().int().nonnegative().default(20000),
         include_full_files: booleanType().default(true),
         // Noise defaults (issue #21). Severity stays owned by verdict.min_severity.
@@ -44992,6 +44999,18 @@ async function callAnthropic(opts) {
         clearTimeout(timer);
     }
 }
+/** Extract the assistant text from an openai-chat response (issue #26).
+ * Reasoning models (DeepSeek V4 flash, GLM, etc.) answer in
+ * `message.reasoning_content` and leave `message.content` empty, so reading
+ * `content` alone produced an empty string — and `??` never fires on `""` —
+ * which looked like a provider failure and was retried 3x for nothing.
+ * Concatenate both, content last so the final answer wins any brace-matching. */
+function extractAssistantText(j) {
+    const msg = j?.choices?.[0]?.message ?? {};
+    const parts = [msg.reasoning_content, msg.reasoning, msg.content]
+        .filter((p) => typeof p === "string" && p.trim().length > 0);
+    return parts.join("\n");
+}
 async function callOpenAICompatible(opts) {
     const base = opts.baseUrl.replace(/\/$/, "");
     const body = {
@@ -45024,7 +45043,7 @@ async function callOpenAICompatible(opts) {
         const usage = typeof u.prompt_tokens === "number" || typeof u.completion_tokens === "number"
             ? { in: u.prompt_tokens ?? 0, out: u.completion_tokens ?? 0 }
             : null;
-        return { text: j.choices?.[0]?.message?.content ?? '{"findings":[]}', usage };
+        return { text: extractAssistantText(j), usage };
     }
     catch (e) {
         if (e.name === "AbortError")
@@ -45122,15 +45141,29 @@ async function runAgent(opts) {
     // review, and the caller can name the missing secret (issue #46)
     if (!rp.apiKey)
         return { findings: [], usage: null, seconds: 0, outcome: "skipped-no-key" };
+    // No time left in the run's budget (issue #51): don't start a call we cannot
+    // finish. Reported as a non-voting outcome, never as a clean review.
+    if (opts.deadlineAt !== undefined && Date.now() >= opts.deadlineAt) {
+        logWarning(`Agent ${opts.agentName}: skipped, run budget exhausted.`);
+        return { findings: [], usage: null, seconds: 0, outcome: "budget-exhausted" };
+    }
     // Retry budget (issue #30): transient empties/5xx must not silently approve.
     // Per-attempt timeout bounds hung gateway connections (the 9-minute run was
     // a single fetch hanging ~5 min with no timeout).
     const maxAttempts = 1 + Math.min(Math.max(opts.provider.retries ?? 2, 0), 5);
-    const timeoutMs = (opts.provider.timeout_s ?? 420) * 1000;
+    // Per-attempt cap, never exceeding what is left of the run's budget (#51).
+    const perAttempt = (opts.provider.timeout_s ?? 420) * 1000;
+    const timeoutMs = opts.deadlineAt === undefined
+        ? perAttempt
+        : Math.max(1_000, Math.min(perAttempt, opts.deadlineAt - Date.now()));
     const started = Date.now();
     let raw = "";
     let usage = null;
     let lastError = "";
+    // An empty-but-successful response is usually deterministic (the model keeps
+    // answering in a field we don't read), so a third attempt just triples the
+    // wall-clock cost. Allow one retry, not `retries` (issue #51).
+    let emptyRetries = 0;
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
         try {
             let out;
@@ -45175,6 +45208,11 @@ async function runAgent(opts) {
             usage = null;
         }
         if (attempt < maxAttempts && isRetryableError(lastError)) {
+            if (lastError.startsWith("empty content")) {
+                if (emptyRetries >= 1)
+                    break; // deterministic: one retry is enough
+                emptyRetries++;
+            }
             logWarning(`Agent ${opts.agentName}: attempt ${attempt}/${maxAttempts} failed (${lastError.slice(0, 160)}); retrying`);
             await sleep(2000 * attempt);
         }
@@ -45462,6 +45500,7 @@ const OUTCOME_LABEL = {
     ok: "✅ reviewed",
     "no-findings": "✅ no findings",
     "skipped-no-key": "⏭️ skipped (no key)",
+    "budget-exhausted": "⏱️ skipped (run budget)",
     unparseable: "⚠️ unusable response",
     error: "❌ failed",
 };
@@ -45996,6 +46035,26 @@ async function getPrDiff(octokit, owner, repo, pr) {
     const { data: pull } = await octokit.rest.pulls.get({ owner, repo, pull_number: pr });
     return { fileNames: names, diff: parts.join("\n\n"), headSha: pull.head.sha };
 }
+/** Run thunks with at most `limit` in flight, preserving result order.
+ * Takes thunks, NOT promises: an already-started promise is in flight before
+ * the pool can see it, so passing promises caps nothing. */
+async function runPooled(thunks, limit) {
+    if (thunks.length === 0)
+        return [];
+    const cap = Math.max(1, Math.min(limit, thunks.length));
+    const out = new Array(thunks.length);
+    let next = 0;
+    const worker = async () => {
+        for (;;) {
+            const i = next++;
+            if (i >= thunks.length)
+                return;
+            out[i] = await thunks[i]();
+        }
+    };
+    await Promise.all(Array.from({ length: cap }, worker));
+    return out;
+}
 async function run() {
     try {
         initLogger();
@@ -46041,6 +46100,18 @@ async function run() {
             logWarning(`Trigger denied: ${gate.reason}. Nothing was reviewed or posted.`);
             return;
         }
+        // Run-wide wall-clock budget (issue #51). Every agent call clamps its own
+        // timeout to what is left, and `runAgent` refuses to start once it is gone.
+        const maxRuntimeS = config.defaults.max_runtime_s ?? 1200;
+        const maxConcurrency = config.defaults.max_concurrency ?? 4;
+        const deadlineAt = Date.now() + maxRuntimeS * 1000;
+        logInfo(`Run budget: ${maxRuntimeS}s total, ${maxConcurrency} agent(s) in flight per review` +
+            (config.reviews.length > 1
+                ? `; projected worst case ~${Math.ceil((config.reviews.length *
+                    config.reviews.reduce((n, r) => n + 1 + r.subagents.length, 0) *
+                    ((config.reviews[0].main ? 3 : 0) + 1)) /
+                    60)} min without the budget kicking in`
+                : ""));
         // Stable session per workflow run (required by OpenCode Go/Zen routing).
         const sessionId = process.env.GITHUB_RUN_ID ?? `${Date.now()}-${Math.random().toString(36).slice(2)}`;
         logInfo(`Reviewing PR #${prNumber} in ${owner}/${repo}`);
@@ -46070,6 +46141,8 @@ async function run() {
                 maxContextChars: review.max_context_chars ?? config.defaults.max_context_chars ?? 20000,
                 ignore: config.defaults.ignore ?? [],
             });
+            // Thunks, not promises: runAgent must not start until the pool allows it
+            // (an eager promise is already in flight, so the cap would be a no-op).
             const tasks = [];
             const agentDefs = [
                 { ...review.main, name: review.main.name ?? `${review.id}:main` },
@@ -46084,7 +46157,7 @@ async function run() {
                     logWarning(`Review ${review.id}: unknown provider '${a.provider}', skipped agent ${a.name}.`);
                     continue;
                 }
-                tasks.push(runAgent({
+                tasks.push(() => runAgent({
                     agentName: a.name ?? "agent",
                     providerName: a.provider,
                     provider,
@@ -46095,6 +46168,7 @@ async function run() {
                     maxDiffChars: config.defaults.max_diff_chars ?? 80000,
                     sessionId,
                     contextBlock,
+                    deadlineAt,
                 })
                     .then((result) => ({
                     findings: result.findings,
@@ -46118,7 +46192,10 @@ async function run() {
                     };
                 }));
             }
-            const results = await Promise.all(tasks);
+            // Bounded fan-out (issue #51): run at most `max_concurrency` agents at a
+            // time instead of bursting every agent at the provider at once. The
+            // thunk is what makes the cap real — see runPooled.
+            const results = await runPooled(tasks, maxConcurrency);
             let findings = results.flatMap((r) => r.findings);
             const agentErrors = results.filter((r) => r.error).map((r) => `- \`${r.agent}\`: ${r.error}`);
             if (review.verdict.deduplicate)

@@ -16,6 +16,8 @@ defaults:
   lang: en
   ignore: ["**.lock", "dist/**"] # path globs skipped everywhere
   max_diff_chars: 80000          # diff truncation budget per agent
+  max_runtime_s: 1200           # wall-clock budget for the whole run (default 1200)
+  max_concurrency: 4            # agents in flight per review (default 4)
   max_context_chars: 20000       # cross-file context budget per review (0 = diff only)
   include_full_files: true       # include full changed files as context by default
 
@@ -65,6 +67,23 @@ reviews:
     include_full_files: true   # or false for diff-only reviews
     max_context_chars: 20000   # per-review budget override
 ```
+
+## Runtime budget
+
+A run's worst case is `reviews x agents x (1 + retries) x timeout_s`, which with
+the shipped defaults is tens of minutes. Two knobs bound it:
+
+- `defaults.max_runtime_s` (30-14400, default 1200): once the budget is spent no
+  further agent call is started, each per-attempt timeout is clamped to what is
+  left, and the remaining agents report `budget-exhausted` — which never casts a
+  verdict.
+- `defaults.max_concurrency` (1-32, default 4): caps agents in flight per review,
+  so a large fan-out is shaped instead of burst.
+
+An empty-but-successful response is retried once, not `retries` times: a model
+that keeps answering in a field we don't read will do so on attempt 3 too, and
+each attempt costs real wall-clock. Raise `retries` for genuinely transient
+failures (5xx, 429, transport).
 
 ## Noise controls (profiles)
 

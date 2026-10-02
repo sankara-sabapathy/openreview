@@ -167,6 +167,7 @@ export type AgentOutcome =
   | "ok" // returned parseable findings
   | "no-findings" // ran fine, nothing to report
   | "skipped-no-key" // no API key for this provider
+  | "budget-exhausted" // run deadline reached before this agent could start
   | "unparseable" // ran, but the response was not usable JSON
   | "error"; // transport/auth/timeout failure (thrown, recorded by the caller)
 
@@ -238,6 +239,19 @@ async function callAnthropic(opts: {
   }
 }
 
+/** Extract the assistant text from an openai-chat response (issue #26).
+ * Reasoning models (DeepSeek V4 flash, GLM, etc.) answer in
+ * `message.reasoning_content` and leave `message.content` empty, so reading
+ * `content` alone produced an empty string — and `??` never fires on `""` —
+ * which looked like a provider failure and was retried 3x for nothing.
+ * Concatenate both, content last so the final answer wins any brace-matching. */
+export function extractAssistantText(j: any): string {
+  const msg = j?.choices?.[0]?.message ?? {};
+  const parts = [msg.reasoning_content, msg.reasoning, msg.content]
+    .filter((p): p is string => typeof p === "string" && p.trim().length > 0);
+  return parts.join("\n");
+}
+
 async function callOpenAICompatible(opts: {
   apiKey: string;
   baseUrl: string;
@@ -280,7 +294,7 @@ async function callOpenAICompatible(opts: {
       typeof u.prompt_tokens === "number" || typeof u.completion_tokens === "number"
         ? { in: u.prompt_tokens ?? 0, out: u.completion_tokens ?? 0 }
         : null;
-    return { text: j.choices?.[0]?.message?.content ?? '{"findings":[]}', usage };
+    return { text: extractAssistantText(j), usage };
   } catch (e) {
     if ((e as Error).name === "AbortError")
       throw new Error(`timeout after ${opts.timeoutMs}ms`);
@@ -403,6 +417,8 @@ export async function runAgent(opts: {
   maxDiffChars: number;
   sessionId: string;
   contextBlock?: string;
+  /** Epoch ms after which no call may be started (issue #51). */
+  deadlineAt?: number;
 }): Promise<AgentResult> {
   const system = SYSTEM_WRAPPER(opts.lang, opts.instructions);
   let user = `Review this unified diff (truncated):\n\n${truncate(opts.diff, opts.maxDiffChars)}`;
@@ -414,16 +430,31 @@ export async function runAgent(opts: {
   // review, and the caller can name the missing secret (issue #46)
   if (!rp.apiKey)
     return { findings: [], usage: null, seconds: 0, outcome: "skipped-no-key" };
+  // No time left in the run's budget (issue #51): don't start a call we cannot
+  // finish. Reported as a non-voting outcome, never as a clean review.
+  if (opts.deadlineAt !== undefined && Date.now() >= opts.deadlineAt) {
+    logWarning(`Agent ${opts.agentName}: skipped, run budget exhausted.`);
+    return { findings: [], usage: null, seconds: 0, outcome: "budget-exhausted" };
+  }
 
   // Retry budget (issue #30): transient empties/5xx must not silently approve.
   // Per-attempt timeout bounds hung gateway connections (the 9-minute run was
   // a single fetch hanging ~5 min with no timeout).
   const maxAttempts = 1 + Math.min(Math.max(opts.provider.retries ?? 2, 0), 5);
-  const timeoutMs = (opts.provider.timeout_s ?? 420) * 1000;
+  // Per-attempt cap, never exceeding what is left of the run's budget (#51).
+  const perAttempt = (opts.provider.timeout_s ?? 420) * 1000;
+  const timeoutMs =
+    opts.deadlineAt === undefined
+      ? perAttempt
+      : Math.max(1_000, Math.min(perAttempt, opts.deadlineAt - Date.now()));
   const started = Date.now();
   let raw = "";
   let usage: Usage = null;
   let lastError = "";
+  // An empty-but-successful response is usually deterministic (the model keeps
+  // answering in a field we don't read), so a third attempt just triples the
+  // wall-clock cost. Allow one retry, not `retries` (issue #51).
+  let emptyRetries = 0;
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     try {
       let out;
@@ -465,6 +496,10 @@ export async function runAgent(opts: {
       usage = null;
     }
     if (attempt < maxAttempts && isRetryableError(lastError)) {
+      if (lastError.startsWith("empty content")) {
+        if (emptyRetries >= 1) break; // deterministic: one retry is enough
+        emptyRetries++;
+      }
       logWarning(
         `Agent ${opts.agentName}: attempt ${attempt}/${maxAttempts} failed (${lastError.slice(0, 160)}); retrying`
       );

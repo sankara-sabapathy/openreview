@@ -1,7 +1,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
-import { readBodyWithIdleTimeout, isRetryableError } from "./providers.js";
+import { readBodyWithIdleTimeout, isRetryableError, extractAssistantText } from "./providers.js";
 
 function serve(
   handler: (req: unknown, res: { writeHead: Function; write: Function; end: Function; flushHeaders: Function }) => void
@@ -269,5 +269,50 @@ describe("isRetryableError", () => {
       assert.equal(e.name, "AbortError");
       return true;
     });
+  });
+});
+
+describe("extractAssistantText (issue #26)", () => {
+  it("reads content when the model used it", () => {
+    assert.equal(
+      extractAssistantText({ choices: [{ message: { content: '{"findings":[]}' } }] }),
+      '{"findings":[]}'
+    );
+  });
+  it("falls back to reasoning_content, the field reasoning models actually use", () => {
+    // DeepSeek V4 flash / GLM answer here and leave content "" -> the old
+    // `content ?? '{"findings":[]}'` never fired ("" is not nullish) and the
+    // agent was reported as "empty content", then retried 3x for nothing.
+    assert.equal(
+      extractAssistantText({
+        choices: [{ message: { reasoning_content: '{"findings":[{"file":"a.ts"}]}' } }],
+      }),
+      '{"findings":[{"file":"a.ts"}]}'
+    );
+  });
+  it("concatenates both, content last so the answer wins", () => {
+    assert.equal(
+      extractAssistantText({
+        choices: [{ message: { reasoning_content: "thinking", content: "answer" } }],
+      }),
+      "thinking\nanswer"
+    );
+  });
+  it("ignores blank/whitespace-only fields", () => {
+    assert.equal(
+      extractAssistantText({ choices: [{ message: { reasoning_content: "  ", content: "" } }] }),
+      ""
+    );
+  });
+  it("tolerates malformed shapes", () => {
+    assert.equal(extractAssistantText({}), "");
+    assert.equal(extractAssistantText({ choices: [] }), "");
+    assert.equal(extractAssistantText({ choices: [{}] }), "");
+    assert.equal(extractAssistantText(null), "");
+  });
+  it("never returns the old fake-empty JSON", () => {
+    // It must be "" so runAgent's "empty content" path (and its 1-retry cap)
+    // still works, rather than a plausible-looking empty review.
+    assert.equal(extractAssistantText({ choices: [{ message: { content: null } }] }), "");
   });
 });
