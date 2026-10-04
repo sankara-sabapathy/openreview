@@ -160,4 +160,5 @@ global_verdict:
   strategy: any_blocking # any_blocking | max_severity | majority
   sticky_comment: true
   # sticky_comment_mode: append # update (default): replace the sticky each run | append: keep a per-run history in one comment
+  sticky_comment_mode: append # TEMPORARY live trial of #69 (unmerged branch): revert before close
   fail_check_on_request_changes: false
