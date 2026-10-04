@@ -130,6 +130,7 @@ reviews:
     # profile: balanced
     # min_confidence: 0.6
     # max_findings: 10
+    # suppress: ["decided-pattern"] # rebutted items that must not resurrect (regex, file + comment)
     # Cross-file context: full changed files + call-site excerpts automatic
     # (bounded by max_context_chars below); add explicit files when needed:
     # context_files: ["src/config.ts"]

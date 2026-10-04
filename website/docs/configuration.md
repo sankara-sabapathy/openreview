@@ -105,6 +105,9 @@ reviews:
     profile: balanced # quiet | balanced | assertive
     min_confidence: 0.6 # explicit knobs override the profile preset
     max_findings: 10
+    # suppress: ["backdate the config"] # decided items: case-insensitive regexes
+    # matched against "<file> <comment>", dropped before verdict math (never vote).
+    # Per-review wins over defaults.suppress. Invalid regex fails load naming the entry.
 ```
 
 | Profile | `min_confidence` | `max_findings` | Effect |

@@ -17,7 +17,7 @@ import {
   type AgentOutcome,
 } from "./providers.js";
 import {
-  matchesAny, filterIgnored, dedupeFindings, decideReviewVerdict, combineVerdicts, combineBallots,
+  matchesAny, filterIgnored, dedupeFindings, applySuppression, decideReviewVerdict, combineVerdicts, combineBallots,
   applyDegradedFloor, resolveNoise, applyNoiseControls, splitDiff, scopeDiff, parseHunkRanges, type Verdict,
   satisfiesActionVersion, runningActionVersion,
 } from "./reviewer.js";
@@ -460,6 +460,19 @@ export async function run(): Promise<void> {
       let findings = results.flatMap((r) => r.findings);
       const agentErrors = results.filter((r) => r.error).map((r) => `- \`${r.agent}\`: ${r.error}`);
       if (review.verdict.deduplicate) findings = dedupeFindings(findings);
+      // Decided items: rebutted patterns suppressed before verdict math —
+      // they neither show nor vote. Per-review wins over defaults.suppress.
+      const suppress = review.suppress ?? config.defaults.suppress ?? [];
+      if (suppress.length > 0) {
+        const preSuppress = findings.length;
+        findings = applySuppression(findings, suppress).visible;
+        if (findings.length < preSuppress) {
+          logInfo(
+            `Review ${review.id}: suppression dropped ${preSuppress - findings.length} decided finding(s) ` +
+              `(${suppress.length} pattern(s))`
+          );
+        }
+      }
       // Noise controls (issue #21): confidence floor + cap, then verdict on survivors.
       const noise = resolveNoise({
         profile: review.profile ?? config.defaults.profile,

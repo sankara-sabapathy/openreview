@@ -668,3 +668,30 @@ describe("resolveDottedProvider (issue #67)", () => {
     assert.doesNotThrow(() => assertProviderRefs(legacy));
   });
 });
+
+describe("suppress patterns validation", () => {
+  const base = {
+    version: 1,
+    providers: { o: { model: "m" } },
+    reviews: [{ id: "r", main: { provider: "o", instructions: "i" } }],
+  };
+  it("rejects an invalid regex naming the entry", () => {
+    assert.throws(
+      () =>
+        parseConfig({
+          ...base,
+          reviews: [{ id: "r", main: { provider: "o", instructions: "i" }, suppress: ["ok(", "[unclosed"] }],
+        }),
+      /suppress\[1\] is not a valid regex/
+    );
+  });
+  it("accepts valid patterns at both levels", () => {
+    const cfg = parseConfig({
+      ...base,
+      defaults: { suppress: ["backdate"] },
+      reviews: [{ id: "r", main: { provider: "o", instructions: "i" }, suppress: ["compat"] }],
+    });
+    assert.deepEqual(cfg.defaults.suppress, ["backdate"]);
+    assert.deepEqual(cfg.reviews[0].suppress, ["compat"]);
+  });
+});

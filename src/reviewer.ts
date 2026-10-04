@@ -152,6 +152,22 @@ export function dedupeFindings<T extends { file: string; line?: number; comment:
 }
 
 /**
+ * Drop findings matching decided-item patterns (rebutted items that must not
+ * resurrect). Each pattern is a case-insensitive regex against
+ * "<file> <comment>". Runs after dedupe, before noise controls and verdict
+ * math — suppressed findings neither show nor vote.
+ */
+export function applySuppression<T extends { file: string; comment: string }>(
+  findings: T[],
+  patterns: string[]
+): { visible: T[]; suppressed: number } {
+  if (patterns.length === 0) return { visible: findings, suppressed: 0 };
+  const res = patterns.map((s) => new RegExp(s, "i"));
+  const visible = findings.filter((f) => !res.some((re) => re.test(`${f.file} ${f.comment}`)));
+  return { visible, suppressed: findings.length - visible.length };
+}
+
+/**
  * A review where only some agents produced a usable result must not report a
  * clean pass: we did not get the whole picture (issue #46). Blocking verdicts
  * are preserved — a degraded review can still escalate.

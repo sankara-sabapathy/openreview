@@ -83,6 +83,26 @@ export const AgentConfig = z.object({
 });
 export type AgentConfig = z.infer<typeof AgentConfig>;
 
+/**
+ * Decided-item suppression patterns (rebutted findings that must not
+ * resurrect). Each entry is a case-insensitive regex tested against
+ * "<file> <comment>". Invalid regex fails config parsing naming the entry —
+ * a silently non-matching pattern would be the exact bug class this kills.
+ */
+export const SuppressPatterns = z.array(z.string()).superRefine((arr, ctx) => {
+  arr.forEach((s, i) => {
+    try {
+      new RegExp(s, "i");
+    } catch {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: `suppress[${i}] is not a valid regex: ${s}`,
+        path: [i],
+      });
+    }
+  });
+});
+
 export const VerdictConfig = z.object({
   mode: z.enum(["comment", "approve", "request_changes"]).default("comment"),
   min_severity: z.enum(["suggestion", "medium", "high"]).default("medium"),
@@ -106,6 +126,9 @@ export const ReviewConfig = z.object({
   profile: z.enum(["quiet", "balanced", "assertive"]).optional(),
   min_confidence: z.number().min(0).max(1).optional(),
   max_findings: z.number().int().positive().optional(),
+  // Decided items: rebutted patterns suppressed before verdict math (win over
+  // defaults.suppress when set).
+  suppress: SuppressPatterns.optional(),
   main: AgentConfig,
   subagents: z.array(AgentConfig).default([]),
   verdict: VerdictConfig.default({}),
@@ -143,6 +166,8 @@ export const OpenReviewConfig = z.object({
       profile: z.enum(["quiet", "balanced", "assertive"]).default("balanced"),
       min_confidence: z.number().min(0).max(1).optional(),
       max_findings: z.number().int().positive().optional(),
+      // Suppression defaults; per-review `suppress` wins when set.
+      suppress: SuppressPatterns.optional(),
     })
     .default({}),
   providers: z.record(z.string(), ProviderConfig),

@@ -44555,6 +44555,26 @@ const AgentConfig = objectType({
     instructions: stringType(),
     // NOTE: no max_files (issue #57 removed the reserved-but-unused key).
 });
+/**
+ * Decided-item suppression patterns (rebutted findings that must not
+ * resurrect). Each entry is a case-insensitive regex tested against
+ * "<file> <comment>". Invalid regex fails config parsing naming the entry —
+ * a silently non-matching pattern would be the exact bug class this kills.
+ */
+const SuppressPatterns = arrayType(stringType()).superRefine((arr, ctx) => {
+    arr.forEach((s, i) => {
+        try {
+            new RegExp(s, "i");
+        }
+        catch {
+            ctx.addIssue({
+                code: ZodIssueCode.custom,
+                message: `suppress[${i}] is not a valid regex: ${s}`,
+                path: [i],
+            });
+        }
+    });
+});
 const VerdictConfig = objectType({
     mode: enumType(["comment", "approve", "request_changes"]).default("comment"),
     min_severity: enumType(["suggestion", "medium", "high"]).default("medium"),
@@ -44576,6 +44596,9 @@ const ReviewConfig = objectType({
     profile: enumType(["quiet", "balanced", "assertive"]).optional(),
     min_confidence: numberType().min(0).max(1).optional(),
     max_findings: numberType().int().positive().optional(),
+    // Decided items: rebutted patterns suppressed before verdict math (win over
+    // defaults.suppress when set).
+    suppress: SuppressPatterns.optional(),
     main: AgentConfig,
     subagents: arrayType(AgentConfig).default([]),
     verdict: VerdictConfig.default({}),
@@ -44610,6 +44633,8 @@ const OpenReviewConfig = objectType({
         profile: enumType(["quiet", "balanced", "assertive"]).default("balanced"),
         min_confidence: numberType().min(0).max(1).optional(),
         max_findings: numberType().int().positive().optional(),
+        // Suppression defaults; per-review `suppress` wins when set.
+        suppress: SuppressPatterns.optional(),
     })
         .default({}),
     providers: recordType(stringType(), ProviderConfig),
@@ -45731,6 +45756,19 @@ function dedupeFindings(findings) {
         out.push(f);
     }
     return out;
+}
+/**
+ * Drop findings matching decided-item patterns (rebutted items that must not
+ * resurrect). Each pattern is a case-insensitive regex against
+ * "<file> <comment>". Runs after dedupe, before noise controls and verdict
+ * math — suppressed findings neither show nor vote.
+ */
+function applySuppression(findings, patterns) {
+    if (patterns.length === 0)
+        return { visible: findings, suppressed: 0 };
+    const res = patterns.map((s) => new RegExp(s, "i"));
+    const visible = findings.filter((f) => !res.some((re) => re.test(`${f.file} ${f.comment}`)));
+    return { visible, suppressed: findings.length - visible.length };
 }
 /**
  * A review where only some agents produced a usable result must not report a
@@ -46950,6 +46988,17 @@ async function run() {
             const agentErrors = results.filter((r) => r.error).map((r) => `- \`${r.agent}\`: ${r.error}`);
             if (review.verdict.deduplicate)
                 findings = dedupeFindings(findings);
+            // Decided items: rebutted patterns suppressed before verdict math —
+            // they neither show nor vote. Per-review wins over defaults.suppress.
+            const suppress = review.suppress ?? config.defaults.suppress ?? [];
+            if (suppress.length > 0) {
+                const preSuppress = findings.length;
+                findings = applySuppression(findings, suppress).visible;
+                if (findings.length < preSuppress) {
+                    logInfo(`Review ${review.id}: suppression dropped ${preSuppress - findings.length} decided finding(s) ` +
+                        `(${suppress.length} pattern(s))`);
+                }
+            }
             // Noise controls (issue #21): confidence floor + cap, then verdict on survivors.
             const noise = resolveNoise({
                 profile: review.profile ?? config.defaults.profile,

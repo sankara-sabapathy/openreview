@@ -100,6 +100,7 @@ reviews:
     profile: balanced # quiet | balanced | assertive (noise preset; explicit knobs below win)
     # min_confidence: 0.6
     # max_findings: 10
+    # suppress: ["compat-date"] # decided items: rebutted patterns that must not resurrect
     # Cross-file context (see website/docs/configuration): full changed files +
     # call-site excerpts are automatic (bounded by max_context_chars); add more:
     # context_files: ["src/types.ts", "db/schema.sql"]
