@@ -14,6 +14,7 @@ import {
   countsAsReview,
 } from "./providers.js";
 import { parseConfig } from "./config.js";
+import { hasNestedQuantifier } from "./config.js";
 
 function serve(
   handler: (req: unknown, res: { writeHead: Function; write: Function; end: Function; flushHeaders: Function }) => void
@@ -666,5 +667,56 @@ describe("resolveDottedProvider (issue #67)", () => {
       reviews: [{ id: "r", main: { provider: "ghost", instructions: "i" } }],
     });
     assert.doesNotThrow(() => assertProviderRefs(legacy));
+  });
+});
+
+describe("suppress patterns validation", () => {
+  const base = {
+    version: 1,
+    providers: { o: { model: "m" } },
+    reviews: [{ id: "r", main: { provider: "o", instructions: "i" } }],
+  };
+  it("rejects an invalid regex naming the entry", () => {
+    assert.throws(
+      () =>
+        parseConfig({
+          ...base,
+          reviews: [{ id: "r", main: { provider: "o", instructions: "i" }, suppress: ["ok(", "[unclosed"] }],
+        }),
+      /suppress\[1\] is not a valid regex/
+    );
+  });
+  it("accepts valid patterns at both levels", () => {
+    const cfg = parseConfig({
+      ...base,
+      defaults: { suppress: ["backdate"] },
+      reviews: [{ id: "r", main: { provider: "o", instructions: "i" }, suppress: ["compat"] }],
+    });
+    assert.deepEqual(cfg.defaults.suppress, ["backdate"]);
+    assert.deepEqual(cfg.reviews[0].suppress, ["compat"]);
+  });
+});
+
+describe("catastrophic patterns (dogfood on #81)", () => {
+  it("flags nested, overlapping and adjacent evil shapes", () => {
+    for (const evil of ["(a+)+$", "(a|ab)+$", "a*a*b*$", "\\d+\\d+$", "(x*|y*)+$", "(a?|b)+$", "([a-z]+)+$", "((a+){2})+", "(a|A)+$", "([a-z]|[A-Z])+$"]) {
+      assert.equal(hasNestedQuantifier(evil), true, `${evil} should be flagged`);
+    }
+  });
+  it("passes the linear shapes", () => {
+    for (const ok of ["compat-date", "backdate the config", "foo.*bar", "(foo|bar)+$", "a+b+$", "\\s+\\S+$", "(ab){2}$", "(a+){2}$", "(a?)+$", "(a{2,3})+$", "https?://\\S+$", "(a|b|c)+$", "\"[^\"]*\"", "((a|b))+$", "(?:a)+$", "(?:foo|bar)+$", "(?=a)+$", "x{2}", "x{2,3}", "\\(a+\\)", "a+", "(ab){2}", "(a+){2}"]) {
+      assert.equal(hasNestedQuantifier(ok), false, `${ok} should pass`);
+    }
+  });
+  it("rejects evil patterns at config load", () => {
+    assert.throws(
+      () =>
+        parseConfig({
+          version: 1,
+          providers: { o: { model: "m" } },
+          reviews: [{ id: "r", main: { provider: "o", instructions: "i" }, suppress: ["(a+)+$"] }],
+        }),
+      /catastrophically slow/
+    );
   });
 });

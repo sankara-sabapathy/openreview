@@ -15,6 +15,7 @@ import {
   scopeDiff,
   parseHunkRanges,
   lineInRanges,
+  applySuppression,
 } from "./reviewer.js";
 
 type V = "approve" | "comment" | "request_changes";
@@ -369,5 +370,21 @@ describe("parseHunkRanges / lineInRanges (issue #53)", () => {
     assert.equal(lineInRanges(9, ranges), false);
     assert.equal(lineInRanges(15, ranges), false);
     assert.equal(lineInRanges(10, []), false);
+  });
+});
+
+describe("applySuppression (decided items)", () => {
+  const F = (file: string, comment: string) => ({ file, comment });
+  it("drops findings matching file or comment, case-insensitively", () => {
+    const { visible, suppressed } = applySuppression(
+      [F("a.ts", "[P1] backdate the config"), F("b.ts", "real bug here"), F("compat.ts", "date check")],
+      ["backdate", "compat\\.ts"]
+    );
+    assert.deepEqual(visible.map((f) => f.file), ["b.ts"]);
+    assert.equal(suppressed, 2);
+  });
+  it("is a no-op without patterns", () => {
+    const fs = [F("a.ts", "x")];
+    assert.deepEqual(applySuppression(fs, []).visible, fs);
   });
 });

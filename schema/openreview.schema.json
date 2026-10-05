@@ -28,7 +28,8 @@
         "include_full_files": { "type": "boolean" },
         "profile": { "enum": ["quiet", "balanced", "assertive"] },
         "min_confidence": { "type": "number", "minimum": 0, "maximum": 1 },
-        "max_findings": { "type": "integer", "minimum": 1 }
+        "max_findings": { "type": "integer", "minimum": 1 },
+        "suppress": { "type": "array", "items": { "type": "string" }, "description": "Decided-item regexes (case-insensitive, tested against file + comment) suppressed before verdict math." }
       }
     },
     "providers": {
@@ -98,6 +99,7 @@
           "profile": { "enum": ["quiet", "balanced", "assertive"] },
           "min_confidence": { "type": "number", "minimum": 0, "maximum": 1 },
           "max_findings": { "type": "integer", "minimum": 1 },
+          "suppress": { "type": "array", "items": { "type": "string" } },
           "verdict": {
             "type": "object",
             "properties": {
