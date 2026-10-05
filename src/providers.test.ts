@@ -14,6 +14,7 @@ import {
   countsAsReview,
 } from "./providers.js";
 import { parseConfig } from "./config.js";
+import { hasNestedQuantifier } from "./config.js";
 
 function serve(
   handler: (req: unknown, res: { writeHead: Function; write: Function; end: Function; flushHeaders: Function }) => void
@@ -693,5 +694,29 @@ describe("suppress patterns validation", () => {
     });
     assert.deepEqual(cfg.defaults.suppress, ["backdate"]);
     assert.deepEqual(cfg.reviews[0].suppress, ["compat"]);
+  });
+});
+
+describe("hasNestedQuantifier (dogfood on #81)", () => {
+  it("rejects the classic catastrophic shapes", () => {
+    for (const evil of ["(a+)+$", "([a-z]+)+", "(a|ab)+$", "((a+)+)+", "(a{2,})+"]) {
+      assert.equal(hasNestedQuantifier(evil), true, `${evil} should be flagged`);
+    }
+  });
+  it("allows ordinary patterns", () => {
+    for (const ok of ["compat-date", "backdate the config", "foo.*bar", "(foo|bar)+", "a+", "x{2}", "x{2,3}", "\\(a+\\)", "(ab){2}"]) {
+      assert.equal(hasNestedQuantifier(ok), false, `${ok} should pass`);
+    }
+  });
+  it("rejects evil patterns at config load", () => {
+    assert.throws(
+      () =>
+        parseConfig({
+          version: 1,
+          providers: { o: { model: "m" } },
+          reviews: [{ id: "r", main: { provider: "o", instructions: "i" }, suppress: ["(a+)+$"] }],
+        }),
+      /catastrophically slow/
+    );
   });
 });

@@ -44560,6 +44560,8 @@ const AgentConfig = objectType({
  * resurrect). Each entry is a case-insensitive regex tested against
  * "<file> <comment>". Invalid regex fails config parsing naming the entry —
  * a silently non-matching pattern would be the exact bug class this kills.
+ * Catastrophically slow patterns (nested quantifiers like `(a+)+$`, which
+ * would stall the synchronous filter) fail the same way.
  */
 const SuppressPatterns = arrayType(stringType()).superRefine((arr, ctx) => {
     arr.forEach((s, i) => {
@@ -44572,9 +44574,259 @@ const SuppressPatterns = arrayType(stringType()).superRefine((arr, ctx) => {
                 message: `suppress[${i}] is not a valid regex: ${s}`,
                 path: [i],
             });
+            return;
+        }
+        if (hasNestedQuantifier(s)) {
+            ctx.addIssue({
+                code: ZodIssueCode.custom,
+                message: `suppress[${i}] looks catastrophically slow (nested quantifiers): ${s} — ` +
+                    `simplify the pattern; it runs synchronously against every finding`,
+                path: [i],
+            });
         }
     });
 });
+/**
+ * True when a regex risks catastrophic backtracking: a quantifier inside a
+ * quantified group (`(a+)+$`), or alternation with overlapping starts under a
+ * quantifier (`(a|ab)+$`, including through nesting like `((a|b))+`) — the
+ * shapes that would stall the synchronous suppress filter (dogfood on #81).
+ * Linear scan, no regex involved. Provably-disjoint direct branches
+ * (`(foo|bar)+`) and bounded repetition (`(ab){2}`, `x{2}`) pass; anything
+ * deeper gives up and flags with a message telling the author to simplify
+ * (e.g. `[\d\w]+` instead of `(\d|\w)+`).
+ */
+function hasNestedQuantifier(src) {
+    const root = { innerQuant: false, alts: [], cur: "", subAlt: false };
+    const stack = [root];
+    const top = () => stack[stack.length - 1];
+    let esc = false;
+    let inClass = false;
+    const flushAlt = (f) => {
+        f.alts.push(f.cur);
+        f.cur = "";
+    };
+    for (let i = 0; i < src.length; i++) {
+        const ch = src[i];
+        if (esc) {
+            top().cur += "\\" + ch;
+            esc = false;
+            continue;
+        }
+        if (ch === "\\") {
+            esc = true;
+            top().cur += ch;
+            continue;
+        }
+        if (inClass) {
+            top().cur += ch;
+            if (ch === "]")
+                inClass = false;
+            continue;
+        }
+        if (ch === "[") {
+            inClass = true;
+            top().cur += ch;
+            continue;
+        }
+        if (ch === "(") {
+            stack.push({ innerQuant: false, alts: [], cur: "", subAlt: false });
+            continue;
+        }
+        if (ch === ")") {
+            const f = stack.pop() ?? { innerQuant: false, alts: [], cur: "", subAlt: false };
+            flushAlt(f);
+            const next = src[i + 1];
+            const quantified = next === "+" || next === "*" || next === "?" || next === "{";
+            // Alternation anywhere DEEPER in the subtree gives up and flags; DIRECT
+            // branches are checked precisely below, so provably-disjoint `(foo|bar)`
+            // still passes.
+            const nestedAlt = f.subAlt;
+            const directOverlap = f.alts.length > 1 && overlappingAlts(f.alts);
+            if (quantified && (f.innerQuant || nestedAlt || directOverlap))
+                return true;
+            if (stack.length > 0) {
+                // Propagate quantifier-content upward: ((a+)) is only dangerous when
+                // an outer group is also quantified.
+                if (f.innerQuant)
+                    stack[stack.length - 1].innerQuant = true;
+                // A quantified group counts as quantifier-containing for its parent.
+                if (quantified)
+                    stack[stack.length - 1].innerQuant = true;
+                // Any alternation in the child subtree (even unquantified) marks the
+                // parent: ((a|b))+ is evil through nesting, not direct overlap.
+                if (f.alts.length > 1 || f.subAlt)
+                    stack[stack.length - 1].subAlt = true;
+                stack[stack.length - 1].cur += `\0${f.alts.length}\0`;
+            }
+            continue;
+        }
+        if (ch === "|") {
+            if (stack.length > 1)
+                flushAlt(top());
+            else
+                top().cur += ch;
+            continue;
+        }
+        if (ch === "+" || ch === "*" || ch === "?") {
+            top().innerQuant = true;
+            top().cur += ch;
+            continue;
+        }
+        if (ch === "{") {
+            // Exact `{n}` is bounded (linear); open ranges are not.
+            if (!/^\{\d+\}/.exec(src.slice(i)))
+                top().innerQuant = true;
+            top().cur += ch;
+            continue;
+        }
+        top().cur += ch;
+    }
+    return false;
+}
+/** Split already collected above; placeholder replaced by real alt text. */
+function overlappingAlts(alts) {
+    if (alts.length < 2)
+        return false;
+    const firsts = alts.map((a) => firstChars(a));
+    // A nullable branch inside a quantified group loops empty: flag it.
+    if (firsts.some((f) => f === null))
+        return true;
+    const sets = firsts;
+    for (let i = 0; i < sets.length; i++) {
+        for (let j = i + 1; j < sets.length; j++) {
+            if (sets[i].has("*") || sets[j].has("*"))
+                return true;
+            for (const c of sets[i])
+                if (sets[j].has(c))
+                    return true;
+        }
+    }
+    return false;
+}
+/**
+ * Possible first chars of a branch (`*` = anything: dot, class negation,
+ * `\d`-style class, nested group starting wide). Null = nullable branch.
+ */
+function firstChars(branch) {
+    let i = 0;
+    const n = branch.length;
+    // Skip group modifiers and zero-width assertions.
+    const mod = /^(?:\(\?[:=!]*)+/.exec(branch);
+    if (mod)
+        i = mod[0].length;
+    for (;;) {
+        if (i >= n)
+            return null;
+        const ch = branch[i];
+        if (ch === "^" || ch === "$") {
+            i++;
+            continue;
+        }
+        if (ch === "\\" && branch[i + 1] === "b") {
+            i += 2;
+            continue;
+        }
+        if (ch === ".")
+            return new Set(["*"]);
+        if (ch === "[") {
+            let j = i + 1;
+            let neg = false;
+            if (branch[j] === "^") {
+                neg = true;
+                j++;
+            }
+            if (branch[j] === "]")
+                j++;
+            const set = new Set();
+            while (j < n && branch[j] !== "]") {
+                if (branch[j] === "\\") {
+                    // Any escape inside a class: be conservative unless a plain char.
+                    const e = branch[j + 1];
+                    if (e === undefined)
+                        break;
+                    if (/[dwsDWS]/.test(e))
+                        return new Set(["*"]);
+                    set.add(e);
+                    j += 2;
+                    continue;
+                }
+                if (branch[j + 1] === "-" && branch[j + 2] !== undefined && branch[j + 2] !== "]") {
+                    const a = branch.charCodeAt(j);
+                    const b = branch.charCodeAt(j + 2);
+                    for (let c = Math.min(a, b); c <= Math.max(a, b); c++)
+                        set.add(String.fromCharCode(c));
+                    j += 3;
+                    continue;
+                }
+                set.add(branch[j]);
+                j++;
+            }
+            if (neg)
+                return new Set(["*"]);
+            return set;
+        }
+        if (ch === "\\") {
+            const e = branch[i + 1];
+            if (e === undefined)
+                return null;
+            if (/[dwsDWS]/.test(e))
+                return new Set(["*"]);
+            return new Set([e]);
+        }
+        if (ch === "(") {
+            // Nested group: union the firsts of its alternatives.
+            let depth = 0;
+            let j = i;
+            let esc2 = false;
+            let inC = false;
+            const parts = [];
+            let cur = "";
+            for (; j < n; j++) {
+                const c = branch[j];
+                if (esc2) {
+                    cur += c;
+                    esc2 = false;
+                    continue;
+                }
+                if (c === "\\") {
+                    cur += c;
+                    esc2 = true;
+                    continue;
+                }
+                if (c === "[")
+                    inC = true;
+                if (c === "]")
+                    inC = false;
+                if (!inC && c === "(")
+                    depth++;
+                if (!inC && c === ")") {
+                    depth--;
+                    if (depth === 0)
+                        break;
+                }
+                if (!inC && c === "|" && depth === 1) {
+                    parts.push(cur);
+                    cur = "";
+                    continue;
+                }
+                cur += c;
+            }
+            parts.push(cur);
+            const inner = parts.map((p) => firstChars(p.replace(/^\(\?[:=!]*/, "")));
+            if (inner.some((s) => s === null))
+                return null;
+            const union = new Set();
+            for (const s of inner)
+                for (const c of s)
+                    union.add(c);
+            return union;
+        }
+        if (ch === "\0")
+            return new Set(["*"]); // replaced group ref: be conservative
+        return new Set([ch]);
+    }
+}
 const VerdictConfig = objectType({
     mode: enumType(["comment", "approve", "request_changes"]).default("comment"),
     min_severity: enumType(["suggestion", "medium", "high"]).default("medium"),
