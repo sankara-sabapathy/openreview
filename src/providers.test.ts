@@ -697,21 +697,15 @@ describe("suppress patterns validation", () => {
   });
 });
 
-describe("hasNestedQuantifier (dogfood on #81)", () => {
-  it("rejects the classic catastrophic shapes", () => {
-    for (const evil of ["(a+)+$", "([a-z]+)+", "(a|ab)+$", "((a+)+)+", "(a{2,})+"]) {
+describe("catastrophic patterns (dogfood on #81)", () => {
+  it("flags nested, overlapping and adjacent evil shapes", () => {
+    for (const evil of ["(a+)+$", "(a|ab)+$", "a*a*b*$", "\\d+\\d+$", "(x*|y*)+$", "(a?|b)+$", "([a-z]+)+$", "((a+){2})+", "(a|A)+$", "([a-z]|[A-Z])+$"]) {
       assert.equal(hasNestedQuantifier(evil), true, `${evil} should be flagged`);
     }
   });
-  it("allows ordinary patterns", () => {
-    for (const ok of ["compat-date", "backdate the config", "foo.*bar", "(foo|bar)+", "a+", "x{2}", "x{2,3}", "\\(a+\\)", "(ab){2}", "(?:a)+", "(?:foo|bar)+", "(?=a)+", "(a+){2}"]) {
+  it("passes the linear shapes", () => {
+    for (const ok of ["compat-date", "backdate the config", "foo.*bar", "(foo|bar)+$", "a+b+$", "\\s+\\S+$", "(ab){2}$", "(a+){2}$", "(a?)+$", "(a{2,3})+$", "https?://\\S+$", "(a|b|c)+$", "\"[^\"]*\"", "((a|b))+$", "(?:a)+$", "(?:foo|bar)+$", "(?=a)+$", "x{2}", "x{2,3}", "\\(a+\\)", "a+", "(ab){2}", "(a+){2}"]) {
       assert.equal(hasNestedQuantifier(ok), false, `${ok} should pass`);
-    }
-  });
-  it("catches dogfood round-3 scanner bugs", () => {
-    // Modifier ? misread as quantifier; case-blind overlap; exact-brace overflag.
-    for (const evil of ["(a|A)+$", "([a-z]|[A-Z])+$", "((a|b))+", "((a+){2})+"]) {
-      assert.equal(hasNestedQuantifier(evil), true, `${evil} should be flagged`);
     }
   });
   it("rejects evil patterns at config load", () => {

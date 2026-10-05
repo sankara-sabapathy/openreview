@@ -116,139 +116,115 @@ export const SuppressPatterns = z.array(z.string()).superRefine((arr, ctx) => {
 });
 
 /**
- * True when a regex risks catastrophic backtracking: a quantifier inside a
- * quantified group (`(a+)+$`), or alternation with overlapping starts under a
- * quantifier (`(a|ab)+$`, including through nesting like `((a|b))+`) — the
- * shapes that would stall the synchronous suppress filter (dogfood on #81).
- * Linear scan, no regex involved. Provably-disjoint direct branches
- * (`(foo|bar)+`) and bounded repetition (`(ab){2}`, `x{2}`) pass; anything
- * deeper gives up and flags with a message telling the author to simplify
- * (e.g. `[\d\w]+` instead of `(\d|\w)+`).
+ * True when a regex risks catastrophic backtracking and would stall the
+ * synchronous suppress filter (dogfood on #81). Three shapes, checked
+ * recursively at every level (new RegExp has already validated the input):
+ * 1. nested unbounded quantifiers — `(a+)+$`, `((a+){2})+$`;
+ * 2. quantified alternation with overlapping starts — `(a|ab)+$`
+ *    (compared case-insensitively, since patterns compile with `i`);
+ * 3. adjacent quantified atoms with overlapping starts — `a*a*b*$`.
+ * Provably-linear shapes pass: disjoint branches (`(foo|bar)+$`),
+ * disjoint sequences (`a+b+$`, `\\s+\\S+$`), bounded repetition
+ * (`(ab){2}`, `x{2}`, `(a?)+`). Anything unprovable flags with a message
+ * telling the author to simplify.
  */
-export function hasNestedQuantifier(src: string): boolean {
-  type Frame = { innerQuant: boolean; alts: string[]; cur: string; subAlt: boolean };
-  const root: Frame = { innerQuant: false, alts: [], cur: "", subAlt: false };
-  const stack: Frame[] = [root];
-  const top = () => stack[stack.length - 1];
+export function hasCatastrophicPattern(src: string): boolean {
+  for (const branch of splitTop(src)) if (checkBranch(branch)) return true;
+  return false;
+}
+
+/** Alias kept for the earlier name; prefer hasCatastrophicPattern. */
+export const hasNestedQuantifier = hasCatastrophicPattern;
+
+type Atom = { first: First; unbounded: boolean; inner?: string; quant?: string };
+
+/** Split on top-level `|` (depth 0), respecting escapes, classes, groups. */
+function splitTop(text: string): string[] {
+  const parts: string[] = [];
+  let cur = "";
+  let depth = 0;
   let esc = false;
   let inClass = false;
-  const flushAlt = (f: Frame) => {
-    f.alts.push(f.cur);
-    f.cur = "";
-  };
-  for (let i = 0; i < src.length; i++) {
-    const ch = src[i];
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
     if (esc) {
-      top().cur += "\\" + ch;
+      cur += ch;
       esc = false;
       continue;
     }
     if (ch === "\\") {
+      cur += ch;
       esc = true;
-      top().cur += ch;
       continue;
     }
-    if (inClass) {
-      top().cur += ch;
-      if (ch === "]") inClass = false;
+    if (ch === "[") inClass = true;
+    if (ch === "]") inClass = false;
+    if (!inClass && ch === "(") depth++;
+    if (!inClass && ch === ")") depth--;
+    if (!inClass && ch === "|" && depth === 0) {
+      parts.push(cur);
+      cur = "";
       continue;
     }
-    if (ch === "[") {
-      inClass = true;
-      top().cur += ch;
-      continue;
-    }
-    if (ch === "(") {
-      stack.push({ innerQuant: false, alts: [], cur: "", subAlt: false });
-      // Group modifiers are not quantifiers: skip `?:`, `?=`, `?!`, `?<=`,
-      // `?<!`, `?<name>` so `(?:a)+` is not misread (dogfood on #81).
-      if (src[i + 1] === "?") {
-        let j = i + 2;
-        if (src[j] === "<") {
-          if (src[j + 1] === "=" || src[j + 1] === "!") j += 2;
-          else while (j < src.length && src[j] !== ">") j++;
-        }
-        while (src[j] === ":" || src[j] === "=" || src[j] === "!") j++;
-        i = j - 1;
-      }
-      continue;
-    }
-    if (ch === ")") {
-      const f = stack.pop() ?? { innerQuant: false, alts: [], cur: "", subAlt: false };
-      flushAlt(f);
-      // Alternation anywhere DEEPER in the subtree gives up and flags; DIRECT
-      // branches are checked precisely below, so provably-disjoint `(foo|bar)`
-      // still passes.
-      const nestedAlt = f.subAlt;
-      const directOverlap = f.alts.length > 1 && overlappingAlts(f.alts);
-      // An exact `{n}` is bounded repetition, not a true quantifier:
-      // `(a+){2}` is linear and passes, while the quantifier-content still
-      // propagates (so `((a+){2})+` is caught). Dogfood on #81.
-      const next = src[i + 1];
-      const braceExact = next === "{" && /^\{\d+\}/.test(src.slice(i + 1));
-      const quantified =
-        next === "+" || next === "*" || next === "?" || (next === "{" && !braceExact);
-      if (quantified && (f.innerQuant || nestedAlt || directOverlap)) return true;
-      if (stack.length > 0) {
-        // Propagate quantifier-content upward: ((a+)) is only dangerous when
-        // an outer group is also quantified.
-        if (f.innerQuant) stack[stack.length - 1].innerQuant = true;
-        // A quantified group counts as quantifier-containing for its parent.
-        if (quantified) stack[stack.length - 1].innerQuant = true;
-        // Any alternation in the child subtree (even unquantified) marks the
-        // parent: ((a|b))+ is evil through nesting, not direct overlap.
-        if (f.alts.length > 1 || f.subAlt) stack[stack.length - 1].subAlt = true;
-        stack[stack.length - 1].cur += `\0${f.alts.length}\0`;
-      }
-      continue;
-    }
-    if (ch === "|") {
-      if (stack.length > 1) flushAlt(top());
-      else top().cur += ch;
-      continue;
-    }
-    if (ch === "+" || ch === "*" || ch === "?") {
-      top().innerQuant = true;
-      top().cur += ch;
-      continue;
-    }
-    if (ch === "{") {
-      // Exact `{n}` is bounded (linear); open ranges are not.
-      if (!/^\{\d+\}/.exec(src.slice(i))) top().innerQuant = true;
-      top().cur += ch;
-      continue;
-    }
-    top().cur += ch;
+    cur += ch;
   }
+  parts.push(cur);
+  return parts;
+}
+
+/** First-char match sets. `any` matches anything; `not` matches anything
+ * outside `chars` (for `\\D`-style complements). Chars are case-folded —
+ * suppress patterns compile case-insensitively (dogfood on #81). */
+type First = { kind: "any" } | { kind: "set"; chars: Set<string> } | { kind: "not"; chars: Set<string> };
+const ANY: First = { kind: "any" };
+
+const DIGITS = new Set("0123456789".split(""));
+const SPACES = new Set([" ", "\t", "\n", "\r", "\f", "\v"]);
+const WORDS = new Set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_".split(""));
+const fold = (c: string): string => c.toLowerCase();
+
+function union(a: First, b: First): First {
+  if (a.kind === "any" || b.kind === "any") return ANY;
+  if (a.kind === "set" && b.kind === "set")
+    return { kind: "set", chars: new Set([...a.chars, ...b.chars]) };
+  if (a.kind === "not" && b.kind === "not") {
+    const shared = new Set<string>();
+    for (const c of a.chars) if (b.chars.has(c)) shared.add(c);
+    return { kind: "not", chars: shared };
+  }
+  const [not, set] = a.kind === "not" ? [a, b] : [b, a];
+  const rest = new Set<string>();
+  for (const c of (set as { chars: Set<string> }).chars)
+    if (!(not as { chars: Set<string> }).chars.has(c)) rest.add(c);
+  return { kind: "set", chars: rest };
+}
+
+function intersects(a: First, b: First): boolean {
+  if (a.kind === "any" || b.kind === "any") return true;
+  if (a.kind === "set" && b.kind === "set") {
+    for (const c of a.chars) if (b.chars.has(c)) return true;
+    return false;
+  }
+  if (a.kind === "not" && b.kind === "not") return true;
+  const [not, set] = a.kind === "not" ? [a, b] : [b, a];
+  for (const c of (set as { chars: Set<string> }).chars)
+    if (!(not as { chars: Set<string> }).chars.has(c)) return true;
   return false;
 }
 
-/** Split already collected above; placeholder replaced by real alt text. */
-function overlappingAlts(alts: string[]): boolean {
-  if (alts.length < 2) return false;
-  const firsts = alts.map((a) => firstChars(a));
-  // A nullable branch inside a quantified group loops empty: flag it.
-  if (firsts.some((f) => f === null)) return true;
-  const sets = firsts as Set<string>[];
-  for (let i = 0; i < sets.length; i++) {
-    for (let j = i + 1; j < sets.length; j++) {
-      if (sets[i].has("*") || sets[j].has("*")) return true;
-      for (const c of sets[i]) if (sets[j].has(c)) return true;
-    }
-  }
-  return false;
-}
-
-/**
- * Possible first chars of a branch (`*` = anything: dot, class negation,
- * `\d`-style class, nested group starting wide). Null = nullable branch.
- */
-function firstChars(branch: string): Set<string> | null {
+/** First-char set of one branch, honouring group modifiers and zero-width. */
+function firstOf(branch: string): First | null {
   let i = 0;
   const n = branch.length;
-  // Skip group modifiers and zero-width assertions.
-  const mod = /^(?:\(\?[:=!]*)+/.exec(branch);
-  if (mod) i = mod[0].length;
+  // Group modifiers: transparent ones (`?:`, `?<name>`) are skipped so the
+  // content decides; lookarounds (`?=`, `?!`, `?<=`, `?<!`) match empty and
+  // their content must not count as a first char — treat as anything.
+  const mod = /^\(\?(?:[:=!]|<[=!]|<[^>]+>)/.exec(branch);
+  if (mod) {
+    const m = mod[0];
+    if (m === "(?:" || (m.startsWith("(?<") && !m.endsWith("=") && !m.endsWith("!"))) i = m.length;
+    else return ANY;
+  }
   for (;;) {
     if (i >= n) return null;
     const ch = branch[i];
@@ -260,7 +236,7 @@ function firstChars(branch: string): Set<string> | null {
       i += 2;
       continue;
     }
-    if (ch === ".") return new Set(["*"]);
+    if (ch === ".") return ANY;
     if (ch === "[") {
       let j = i + 1;
       let neg = false;
@@ -272,79 +248,233 @@ function firstChars(branch: string): Set<string> | null {
       const set = new Set<string>();
       while (j < n && branch[j] !== "]") {
         if (branch[j] === "\\") {
-          // Any escape inside a class: be conservative unless a plain char.
           const e = branch[j + 1];
           if (e === undefined) break;
-          if (/[dwsDWS]/.test(e)) return new Set(["*"]);
-          set.add(e.toLowerCase());
+          if (e === "d") for (const c of DIGITS) set.add(c);
+          else if (e === "s") for (const c of SPACES) set.add(c);
+          else if (e === "w") for (const c of WORDS) set.add(c);
+          else if (/[DSW]/.test(e)) return ANY;
+          else set.add(fold(e));
           j += 2;
           continue;
         }
         if (branch[j + 1] === "-" && branch[j + 2] !== undefined && branch[j + 2] !== "]") {
           const a = branch.charCodeAt(j);
           const b = branch.charCodeAt(j + 2);
-          for (let c = Math.min(a, b); c <= Math.max(a, b); c++) set.add(String.fromCharCode(c).toLowerCase());
+          for (let c = Math.min(a, b); c <= Math.max(a, b); c++) set.add(fold(String.fromCharCode(c)));
           j += 3;
           continue;
         }
-        set.add(branch[j].toLowerCase());
+        set.add(fold(branch[j]));
         j++;
       }
-      if (neg) return new Set(["*"]);
-      return set;
+      if (neg) return { kind: "not", chars: set };
+      return { kind: "set", chars: set };
     }
     if (ch === "\\") {
       const e = branch[i + 1];
       if (e === undefined) return null;
-      if (/[dwsDWS]/.test(e)) return new Set(["*"]);
-      return new Set([e.toLowerCase()]);
+      if (e === "d") return { kind: "set", chars: new Set(DIGITS) };
+      if (e === "s") return { kind: "set", chars: new Set(SPACES) };
+      if (e === "w") return { kind: "set", chars: new Set(WORDS) };
+      if (e === "D") return { kind: "not", chars: new Set(DIGITS) };
+      if (e === "S") return { kind: "not", chars: new Set(SPACES) };
+      if (e === "W") return { kind: "not", chars: new Set(WORDS) };
+      return { kind: "set", chars: new Set([fold(e)]) };
     }
     if (ch === "(") {
-      // Nested group: union the firsts of its alternatives.
-      let depth = 0;
-      let j = i;
-      let esc2 = false;
-      let inC = false;
-      const parts: string[] = [];
-      let cur = "";
-      for (; j < n; j++) {
-        const c = branch[j];
-        if (esc2) {
-          cur += c;
-          esc2 = false;
-          continue;
-        }
-        if (c === "\\") {
-          cur += c;
-          esc2 = true;
-          continue;
-        }
-        if (c === "[") inC = true;
-        if (c === "]") inC = false;
-        if (!inC && c === "(") depth++;
-        if (!inC && c === ")") {
-          depth--;
-          if (depth === 0) break;
-        }
-        if (!inC && c === "|" && depth === 1) {
-          parts.push(cur);
-          cur = "";
-          continue;
-        }
-        cur += c;
+      const close = matchParen(branch, i);
+      const inner = branch.slice(i + 1, close);
+      let out: First = { kind: "set", chars: new Set() };
+      for (const alt of splitTop(inner)) {
+        const f = firstOf(alt);
+        if (f === null) return null;
+        out = union(out, f);
       }
-      parts.push(cur);
-      const inner = parts.map((p) => firstChars(p.replace(/^\(\?[:=!]*/, "")));
-      if (inner.some((s) => s === null)) return null;
-      const union = new Set<string>();
-      for (const s of inner) for (const c of s as Set<string>) union.add(c);
-      return union;
+      return out;
     }
-    if (ch === "\0") return new Set(["*"]); // replaced group ref: be conservative
-    // Folded: suppress patterns compile case-insensitively, so `A` ≡ `a`
-    // (dogfood on #81 caught `([a-z]|[A-Z])+$` slipping through).
-    return new Set([ch.toLowerCase()]);
+    return { kind: "set", chars: new Set([fold(ch)]) };
   }
+}
+
+/** Index of the `)` matching the `(` at pos (nest- and class-aware). */
+function matchParen(text: string, pos: number): number {
+  let depth = 0;
+  let esc = false;
+  let inClass = false;
+  for (let i = pos; i < text.length; i++) {
+    const ch = text[i];
+    if (esc) {
+      esc = false;
+      continue;
+    }
+    if (ch === "\\") {
+      esc = true;
+      continue;
+    }
+    if (ch === "[") inClass = true;
+    if (ch === "]") inClass = false;
+    if (inClass) continue;
+    if (ch === "(") depth++;
+    if (ch === ")") {
+      depth--;
+      if (depth === 0) return i;
+    }
+  }
+  return text.length;
+}
+
+/** Quantifier starting at pos: exact `{n}` is bounded, everything else open. */
+function readQuant(text: string, pos: number): { unbounded: boolean; end: number; text: string } | null {
+  const ch = text[pos];
+  if (ch === "+" || ch === "*") return { unbounded: true, end: pos + 1, text: ch };
+  if (ch === "?") return { unbounded: false, end: pos + 1, text: ch };
+  if (ch === "{") {
+    const m = /^\{(\d+)(,(\d*)?)?\}/.exec(text.slice(pos));
+    if (!m) return null;
+    const openEnded = m[2] !== undefined && (m[3] ?? "") === "";
+    return { unbounded: openEnded, end: pos + m[0].length, text: m[0] };
+  }
+  return null;
+}
+
+/** Top-level atoms of a branch; groups carry inner source + quantifier text. */
+function tokenize(branch: string): Atom[] {
+  const atoms: Atom[] = [];
+  let i = 0;
+  const n = branch.length;
+  const skipZeroWidth = () => {
+    for (;;) {
+      if (i < n && (branch[i] === "^" || branch[i] === "$")) {
+        i++;
+        continue;
+      }
+      if (branch[i] === "\\" && branch[i + 1] === "b") {
+        i += 2;
+        continue;
+      }
+      break;
+    }
+  };
+  while (i < n) {
+    skipZeroWidth();
+    if (i >= n) break;
+    if (branch[i] === "|") {
+      i++;
+      continue; // nested-level pipes belong to splitTop callers
+    }
+    let first: First;
+    let inner: string | undefined;
+    if (branch[i] === "(") {
+      const close = matchParen(branch, i);
+      inner = branch.slice(i + 1, close);
+      let out: First = { kind: "set", chars: new Set() };
+      for (const alt of splitTop(inner)) {
+        const f = firstOf(alt);
+        if (f === null) {
+          out = ANY;
+          break;
+        }
+        out = union(out, f);
+      }
+      first = out;
+      i = close + 1;
+    } else {
+      const f = firstOf(branch.slice(i));
+      first = f ?? ANY;
+      if (branch[i] === "[") {
+        let j = i + 1;
+        let esc2 = false;
+        while (j < n) {
+          if (esc2) {
+            esc2 = false;
+            j++;
+            continue;
+          }
+          if (branch[j] === "\\") {
+            esc2 = true;
+            j++;
+            continue;
+          }
+          j++;
+          if (branch[j - 1] === "]" && j > i + 2) break;
+        }
+        i = j;
+      } else if (branch[i] === "\\") {
+        i += 2;
+      } else {
+        i++;
+      }
+    }
+    const q = readQuant(branch, i);
+    atoms.push({ first, unbounded: q !== null && q.unbounded, inner, quant: q?.text });
+    if (q) i = q.end;
+  }
+  return atoms;
+}
+
+/** `?`, `*`, `{0}`, `{0,}`, `{0,m}` match empty; `+`, `{n}`, `{n,m}` do not. */
+function nullableQuant(q: string | undefined): boolean {
+  if (q === undefined) return false;
+  if (q === "?" || q === "*") return true;
+  const m = /^\{(\d+)(,(\d*)?)?\}$/.exec(q);
+  return !!m && m[1] === "0";
+}
+
+/** A branch is nullable when every atom can match empty. */
+function nullableBranch(branch: string): boolean {
+  return tokenize(branch).every(
+    (a) => nullableQuant(a.quant) || (a.inner !== undefined && splitTop(a.inner).some(nullableBranch))
+  );
+}
+
+function checkBranch(branch: string): boolean {
+  const atoms = tokenize(branch);
+  for (let k = 0; k + 1 < atoms.length; k++) {
+    if (atoms[k].unbounded && atoms[k + 1].unbounded && intersects(atoms[k].first, atoms[k + 1].first))
+      return true;
+  }
+  for (const a of atoms) {
+    if (a.inner !== undefined && checkGroup(a.inner, a.quant)) return true;
+  }
+  return false;
+}
+
+function checkGroup(inner: string, quant?: string): boolean {
+  const branches = splitTop(inner);
+  const unbounded = quant !== undefined && isUnboundedQuant(quant);
+  if (branches.length > 1 && unbounded) {
+    const firsts = branches.map((b) => firstOf(b));
+    for (let i = 0; i < firsts.length; i++)
+      for (let j = i + 1; j < firsts.length; j++) {
+        const [x, y] = [firsts[i], firsts[j]];
+        if (x === null || y === null || intersects(x, y)) return true;
+      }
+    if (branches.some((b) => nullableBranch(b))) return true;
+  }
+  if (unbounded && subtreeUnbounded(inner)) return true;
+  for (const b of branches) if (checkBranch(b)) return true;
+  return false;
+}
+
+/** `+`, `*`, `{n,}` repeat without bound; `?`, `{n}`, `{n,m}` do not. */
+function isUnboundedQuant(q: string): boolean {
+  if (q === "+" || q === "*") return true;
+  if (q === "?") return false;
+  const m = /^\{(\d+)(,(\d*)?)?\}$/.exec(q);
+  if (!m) return true; // malformed (validated earlier) — stay conservative
+  return m[2] !== undefined && (m[3] ?? "") === "";
+}
+
+/** Any unbounded quantifier anywhere in the (sub)pattern. */
+function subtreeUnbounded(text: string): boolean {
+  for (const branch of splitTop(text)) {
+    for (const a of tokenize(branch)) {
+      if (a.unbounded) return true;
+      if (a.inner !== undefined && subtreeUnbounded(a.inner)) return true;
+    }
+  }
+  return false;
 }
 
 export const VerdictConfig = z.object({
