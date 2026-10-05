@@ -44631,18 +44631,37 @@ function hasNestedQuantifier(src) {
         }
         if (ch === "(") {
             stack.push({ innerQuant: false, alts: [], cur: "", subAlt: false });
+            // Group modifiers are not quantifiers: skip `?:`, `?=`, `?!`, `?<=`,
+            // `?<!`, `?<name>` so `(?:a)+` is not misread (dogfood on #81).
+            if (src[i + 1] === "?") {
+                let j = i + 2;
+                if (src[j] === "<") {
+                    if (src[j + 1] === "=" || src[j + 1] === "!")
+                        j += 2;
+                    else
+                        while (j < src.length && src[j] !== ">")
+                            j++;
+                }
+                while (src[j] === ":" || src[j] === "=" || src[j] === "!")
+                    j++;
+                i = j - 1;
+            }
             continue;
         }
         if (ch === ")") {
             const f = stack.pop() ?? { innerQuant: false, alts: [], cur: "", subAlt: false };
             flushAlt(f);
-            const next = src[i + 1];
-            const quantified = next === "+" || next === "*" || next === "?" || next === "{";
             // Alternation anywhere DEEPER in the subtree gives up and flags; DIRECT
             // branches are checked precisely below, so provably-disjoint `(foo|bar)`
             // still passes.
             const nestedAlt = f.subAlt;
             const directOverlap = f.alts.length > 1 && overlappingAlts(f.alts);
+            // An exact `{n}` is bounded repetition, not a true quantifier:
+            // `(a+){2}` is linear and passes, while the quantifier-content still
+            // propagates (so `((a+){2})+` is caught). Dogfood on #81.
+            const next = src[i + 1];
+            const braceExact = next === "{" && /^\{\d+\}/.test(src.slice(i + 1));
+            const quantified = next === "+" || next === "*" || next === "?" || (next === "{" && !braceExact);
             if (quantified && (f.innerQuant || nestedAlt || directOverlap))
                 return true;
             if (stack.length > 0) {
@@ -44747,7 +44766,7 @@ function firstChars(branch) {
                         break;
                     if (/[dwsDWS]/.test(e))
                         return new Set(["*"]);
-                    set.add(e);
+                    set.add(e.toLowerCase());
                     j += 2;
                     continue;
                 }
@@ -44755,11 +44774,11 @@ function firstChars(branch) {
                     const a = branch.charCodeAt(j);
                     const b = branch.charCodeAt(j + 2);
                     for (let c = Math.min(a, b); c <= Math.max(a, b); c++)
-                        set.add(String.fromCharCode(c));
+                        set.add(String.fromCharCode(c).toLowerCase());
                     j += 3;
                     continue;
                 }
-                set.add(branch[j]);
+                set.add(branch[j].toLowerCase());
                 j++;
             }
             if (neg)
@@ -44772,7 +44791,7 @@ function firstChars(branch) {
                 return null;
             if (/[dwsDWS]/.test(e))
                 return new Set(["*"]);
-            return new Set([e]);
+            return new Set([e.toLowerCase()]);
         }
         if (ch === "(") {
             // Nested group: union the firsts of its alternatives.
@@ -44824,7 +44843,9 @@ function firstChars(branch) {
         }
         if (ch === "\0")
             return new Set(["*"]); // replaced group ref: be conservative
-        return new Set([ch]);
+        // Folded: suppress patterns compile case-insensitively, so `A` ≡ `a`
+        // (dogfood on #81 caught `([a-z]|[A-Z])+$` slipping through).
+        return new Set([ch.toLowerCase()]);
     }
 }
 const VerdictConfig = objectType({

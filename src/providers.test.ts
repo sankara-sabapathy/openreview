@@ -704,8 +704,14 @@ describe("hasNestedQuantifier (dogfood on #81)", () => {
     }
   });
   it("allows ordinary patterns", () => {
-    for (const ok of ["compat-date", "backdate the config", "foo.*bar", "(foo|bar)+", "a+", "x{2}", "x{2,3}", "\\(a+\\)", "(ab){2}"]) {
+    for (const ok of ["compat-date", "backdate the config", "foo.*bar", "(foo|bar)+", "a+", "x{2}", "x{2,3}", "\\(a+\\)", "(ab){2}", "(?:a)+", "(?:foo|bar)+", "(?=a)+", "(a+){2}"]) {
       assert.equal(hasNestedQuantifier(ok), false, `${ok} should pass`);
+    }
+  });
+  it("catches dogfood round-3 scanner bugs", () => {
+    // Modifier ? misread as quantifier; case-blind overlap; exact-brace overflag.
+    for (const evil of ["(a|A)+$", "([a-z]|[A-Z])+$", "((a|b))+", "((a+){2})+"]) {
+      assert.equal(hasNestedQuantifier(evil), true, `${evil} should be flagged`);
     }
   });
   it("rejects evil patterns at config load", () => {
