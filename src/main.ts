@@ -8,7 +8,9 @@ import { ZodError } from "zod";
 import { templateContextFor, resolveExtends, mergeConfigs, parseConfigLoose } from "./templates.js";
 import {
   resolveKeysFromEnv,
-  runAgent,
+  runAgentWithFallback,
+  ChainFailedError,
+  type ModelLeg,
   formatTokens,
   countsAsReview,
   AgentFailedError,
@@ -233,6 +235,20 @@ export async function getIncrementalDiff(
       `PR head moved during incremental diff fetch (${head.slice(0, 7)} -> ${freshSha.slice(0, 7)}); aborting - a fresh review runs on the new head.`
     );
   return { fileNames: names, diff: parts.join("\n\n"), headSha: freshSha, omitted, truncated, totalFiles: files.length, stale };
+}
+
+/** Sticky note for an agent that moved down its fallback chain (issue #101):
+ * `a → b (why a failed)`. Undefined when the first model answered alone. */
+export function describeFallback(legs: ModelLeg[] | undefined): string | undefined {
+  if (!legs || legs.length < 2) return undefined;
+  const why = legs[0].error ? ` (${firstLine(legs[0].error).slice(0, 80)})` : "";
+  return `${legs.map((l) => l.model).join(" → ")}${why}`;
+}
+
+function firstLine(s: string): string {
+  // Provider bodies are JSON; prefer the human message inside when present.
+  const m = /"message"\s*:\s*"([^"]{1,200})"/.exec(s);
+  return (m ? m[1] : s).split("\n")[0];
 }
 
 /** One agent's accounted spend: totals across all its attempts (issue #52). */
@@ -664,6 +680,8 @@ export async function run(): Promise<void> {
       outcome: AgentOutcome;
       seconds: number;
       error?: string;
+      /** e.g. "cat-jam-free → glm-5.3-flash (Model is unavailable)" */
+      fallback?: string;
     };
     const perReview: {
       id: string;
@@ -775,6 +793,8 @@ export async function run(): Promise<void> {
         providerName: string;
         model: string;
         synthesis?: Synthesis;
+        /** Models tried along the fallback chain (issue #101), in order. */
+        legs?: ModelLeg[];
       };
       // Prior-round carry for incremental reviews (issue #18). Rendered once
       // per review; subagents validate each entry, the synthesizer inherits
@@ -818,7 +838,7 @@ export async function run(): Promise<void> {
         }
         const p = provider;
         return (priorFindings?: string) =>
-          runAgent({
+          runAgentWithFallback({
             agentName: a.name,
             providerName: a.provider,
             provider: p,
@@ -846,8 +866,9 @@ export async function run(): Promise<void> {
               outcome: result.outcome,
               agent: a.name,
               providerName: a.provider,
-              model: p.model,
+              model: result.model,
               synthesis: result.synthesis,
+              legs: result.legs,
             }))
             .catch((e): TaskResult => {
               const msg = (e as Error).message;
@@ -871,6 +892,7 @@ export async function run(): Promise<void> {
                 agent: a.name,
                 providerName: a.provider,
                 model: p.model,
+                legs: e instanceof ChainFailedError ? e.legs : undefined,
               };
             });
       };
@@ -1048,6 +1070,7 @@ export async function run(): Promise<void> {
           providerName: r.providerName,
           outcome: r.outcome,
           seconds: r.seconds,
+          fallback: describeFallback(r.legs),
         })),
         usage: results
           // Every agent that started an attempt is accounted for (issue #52):
@@ -1055,17 +1078,33 @@ export async function run(): Promise<void> {
           // never started (no key, no budget left) are absent — and those are
           // named separately in the skipped-key warning below.
           .filter((r) => r.attempts > 0)
-          .map((r) => ({
-            agent: r.agent,
-            // Resolved model travels with the result: dotted refs
-            // (`opencode.flash`) have no top-level entry to look up (issue #67).
-            model: r.model,
-            usage: r.usage,
-            seconds: r.seconds,
-            attempts: r.attempts,
-            startedAt: r.startedAt,
-            endedAt: r.endedAt,
-          })),
+          .flatMap((r) =>
+            // A fallback chain spent on every model it tried (issue #101):
+            // one record per leg so the Models footer names each of them.
+            r.legs && r.legs.length > 1
+              ? r.legs
+                  .filter((l) => l.attempts > 0)
+                  .map((l) => ({
+                    agent: r.agent,
+                    model: l.model,
+                    usage: l.usage,
+                    seconds: l.seconds,
+                    attempts: l.attempts,
+                    startedAt: l.startedAt,
+                    endedAt: l.endedAt,
+                  }))
+              : [{
+                  agent: r.agent,
+                  // Resolved model travels with the result: dotted refs
+                  // (`opencode.flash`) have no top-level entry to look up (issue #67).
+                  model: r.model,
+                  usage: r.usage,
+                  seconds: r.seconds,
+                  attempts: r.attempts,
+                  startedAt: r.startedAt,
+                  endedAt: r.endedAt,
+                }]
+          ),
         carried: carried.length > 0 ? carried : undefined,
         ledger,
       });

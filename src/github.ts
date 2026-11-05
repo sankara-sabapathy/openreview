@@ -152,6 +152,8 @@ type RunContentOpts = {
     provider: string;
     outcome: string;
     seconds: number;
+    /** Fallback chain note (issue #101), shown under the provider. */
+    fallback?: string;
   }[];
   findings?: {
     file: string;
@@ -236,7 +238,7 @@ function renderRunBody(opts: RunContentOpts): string[] {
     lines.push("|---|---|---|---|");
     for (const a of agents) {
       lines.push(
-        `| ${a.agent} | ${a.provider} | ${OUTCOME_LABEL[a.outcome] ?? a.outcome} | ${a.seconds.toFixed(1)}s |`
+        `| ${a.agent} | ${a.provider}${a.fallback ? `<br><sub>fallback: ${cell(sanitizeErrorDetail(a.fallback, 160), 160).replace(/</g, "&lt;").replace(/>/g, "&gt;")}</sub>` : ""} | ${OUTCOME_LABEL[a.outcome] ?? a.outcome} | ${a.seconds.toFixed(1)}s |`
       );
     }
     lines.push("");
@@ -433,6 +435,8 @@ export function renderStickyBody(opts: {
     provider: string;
     outcome: string;
     seconds: number;
+    /** Fallback chain note (issue #101), shown under the provider. */
+    fallback?: string;
   }[];
   findings: {
     file: string;

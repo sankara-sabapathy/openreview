@@ -18,6 +18,11 @@ jobs:
         id: release
         with:
           release-type: node
+          # PRs opened with the default GITHUB_TOKEN do not trigger workflows,
+          # so release PRs merged with no CI (0-job runs on the 0.17.0 PR).
+          # A PAT or GitHub App token in RELEASE_PLEASE_TOKEN fixes that; the
+          # fallback keeps releases working until the secret exists.
+          token: ${{ secrets.RELEASE_PLEASE_TOKEN || github.token }}
   move-major:
     needs: release-please
     if: ${{ needs.release-please.outputs.release_created == 'true' }}
@@ -28,10 +33,16 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - name: Move v1 tag to release
+      - name: Move floating tags (v0, v1) to the release
+        env:
+          TAG: ${{ needs.release-please.outputs.tag_name }} # e.g. v0.17.0
         run: |
-          TAG="${{ needs.release-please.outputs.tag_name }}" # e.g. v0.2.0
-          MAJOR=$(echo "$TAG" | cut -d. -f1) # v0
+          # Docs and README tell users to pin @v1, but releases are still v0.x,
+          # so the major-from-tag rule alone only ever moved v0 and left v1
+          # stale (v1 sat on v0.13.0 through 0.17.0). Move both.
+          MAJOR=$(echo "$TAG" | cut -d. -f1)
           git fetch --tags
-          git tag -f "$MAJOR" "$TAG"
-          git push origin "$MAJOR" --force
+          for t in $(printf '%s\n' "$MAJOR" v1 | sort -u); do
+            git tag -f "$t" "$TAG"
+            git push origin "refs/tags/$t" --force
+          done

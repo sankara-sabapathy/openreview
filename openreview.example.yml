@@ -40,6 +40,13 @@ providers:
                                      # other Go models: glm-5.3-flash, kimi-k2.7-code, ...
     # retries: 2 # retry budget for empty/5xx/429/network (0-5, default 2)
     # timeout_s: 420 # per-attempt TOTAL cap, seconds (default 420); 90s idle + 60s/1KB trickle guards always on
+    # Models tried in order when this one is unavailable, unknown, out of quota,
+    # or still failing after its retries (max 5). Same transport + key; a step
+    # is a bare id or { model, retries, timeout_s, json_mode, extra_body }.
+    # Auth errors never fall back. The run's max_runtime_s covers the whole chain.
+    # fallback_models:
+    #   - glm-5.3-flash
+    #   - { model: deepseek-v4.1-flash, extra_body: { reasoning_effort: "low" } }
     # Named per-model overrides sharing this entry's transport + credential
     # (agents use `provider: opencode.flash`). Each entry merges over the base;
     # only set keys win, so `{ model: ... }` alone keeps base retries/timeout.
