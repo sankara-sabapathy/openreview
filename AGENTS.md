@@ -37,8 +37,8 @@ verdicts, and posts a sticky comment + inline review.
 - `.github/openreview.yml` — this repo's own dogfood config (see rule below).
 - `.github/workflows/` — `ai-review.yml` (dogfood trigger; named to not collide
   with the `openreview.yml` config), `ci.yml` (typecheck/build/
-  package/validate + dist-fresh check), `release.yml` (release-please + move `v0`
-  tag), `docs.yml` (Pages deploy).
+  package/validate + dist-fresh check), `release.yml` (release-please + move `v0`/`v1`
+  tags), `docs.yml` (Pages deploy).
 - `website/` — Docusaurus v3 docs site, deployed to GitHub Pages from `main`.
 - `benchmark/` — bug benchmark: `cases/<id>/` (before/after trees, generated
   `patch.diff`, `case.json` with seeded bugs). `src/bench.ts` reviews every case
@@ -53,8 +53,8 @@ verdicts, and posts a sticky comment + inline review.
    yamls keep working. Breaking changes wait for `version: 2` + migration guide.
 3. **`kind:` is deprecated but supported.** Keep the `kindDefaults` mapping in
    `providers.ts` until a v2 cleanup.
-4. **Action version tags:** release-please cuts `v0.x.y`; `release.yml` moves `v0`.
-   `v1` is moved manually to the latest release (`git tag -f v1 v0.x.y && git push origin v1 --force`).
+4. **Action version tags:** release-please cuts `v0.x.y`; `release.yml` moves both
+   `v0` and `v1` to every release, so there is no manual tag step.
 5. **No per-release Marketplace step.** The listing tracks the latest GitHub Release
    automatically after the one-time publish.
 6. **Secrets never in logs.** Keys travel as env only; error messages must not echo them.
@@ -91,7 +91,7 @@ lane; verify every snippet against the code before committing.
   fix PR is "reviewed" by the code it is fixing). The **final commit before
   merge** restores `uses: sankara-sabapathy/openreview@v1`. `uses: ./` needs
   `dist/` committed and fresh, which CI already enforces.
-- Live dogfood: push to `main`, move `v1` after release, open a **temporary** PR with
+- Live dogfood: push to `main`, let the release move `v1`, open a **temporary** PR with
   a buggy fixture file, verify sticky + inline comments, then close unmerged and
   delete the branch. Each run spends real provider budget — one verification PR per
   behavior change, not per commit.
