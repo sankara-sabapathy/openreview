@@ -295,7 +295,9 @@ export class AgentFailedError extends Error {
     readonly usageTotal: { in: number; out: number } | null,
     readonly seconds: number,
     readonly startedAt: number,
-    readonly endedAt: number
+    readonly endedAt: number,
+    /** The last attempt's raw error, so a fallback chain can classify it. */
+    readonly lastError: string = ""
   ) {
     super(message);
     this.name = "AgentFailedError";
@@ -338,7 +340,7 @@ async function callAnthropic(opts: {
     });
     // Idle 90s: streaming (slow) responses survive, dead hangs die fast.
     const text = await readBodyWithIdleTimeout(res, 90000, "anthropic");
-    if (!res.ok) throw new Error(`anthropic ${res.status}: ${text}`);
+    if (!res.ok) throw new Error(`anthropic ${res.status}${retryAfterNote(res)}: ${text}`);
     const j = JSON.parse(text) as any;
     const out = (j.content ?? [])
       .filter((b: any) => b.type === "text")
@@ -465,7 +467,7 @@ async function callOpenAICompatible(opts: {
     });
     // Idle 90s: streaming (slow) responses survive, dead hangs die fast.
     const text = await readBodyWithIdleTimeout(res, 90000, "llm");
-    if (!res.ok) throw new Error(`llm ${base} ${res.status}: ${text}`);
+    if (!res.ok) throw new Error(`llm ${base} ${res.status}${retryAfterNote(res)}: ${text}`);
     const j = JSON.parse(text) as any;
     const u = j.usage ?? {};
     const usage: Usage =
@@ -631,6 +633,54 @@ export function isRetryableError(message: string): boolean {
   );
 }
 
+/** ` (retry-after Ns)` when a 429/503 names a wait, else "". Kept in the
+ * error text so the retry loop can honor it without threading headers. */
+export function retryAfterNote(res: { status: number; headers?: { get(name: string): string | null } }): string {
+  if (res.status !== 429 && res.status !== 503) return "";
+  const s = parseRetryAfter(res.headers?.get("retry-after") ?? null, Date.now());
+  return s === null ? "" : ` (retry-after ${s}s)`;
+}
+
+/** Retry-After as whole seconds: delta-seconds or an HTTP date. Null when absent or unparseable. */
+export function parseRetryAfter(value: string | null, now: number): number | null {
+  if (!value) return null;
+  const v = value.trim();
+  if (/^\d+$/.test(v)) return Number(v);
+  const at = Date.parse(v);
+  if (Number.isNaN(at)) return null;
+  return Math.max(0, Math.ceil((at - now) / 1000));
+}
+
+/** Upper bound on one Retry-After wait; past this a fallback model or the
+ * next run is the better use of the budget. */
+const MAX_RETRY_AFTER_MS = 60_000;
+
+/** Backoff before retry `attempt`: linear 2s steps, raised to the provider's
+ * Retry-After when it named one (capped at 60s). Callers still clamp to the
+ * run deadline. */
+export function retryBackoffMs(lastError: string, attempt: number): number {
+  const base = 2000 * attempt;
+  const m = /\(retry-after (\d+)s\)/.exec(lastError);
+  if (!m) return base;
+  return Math.max(base, Math.min(Number(m[1]) * 1000, MAX_RETRY_AFTER_MS));
+}
+
+/** Errors about the MODEL rather than the request or the key (issue #101):
+ * retired, paused, unknown or not served, or out of quota/usage for it. The
+ * same model will not recover within a run, so retries are skipped and a
+ * fallback model (when configured) is tried instead. */
+export function isModelLevelError(message: string): boolean {
+  return /\bmodel\b[^.\n]{0,40}?\b(is )?(unavailable|not (found|available|supported)|does not exist|deprecated|retired|disabled)|\b(unknown|invalid|unsupported|no such) model\b|model_not_found| 402[:\s]|payment required|insufficient[_ ]quota|quota (exceeded|exhausted)|usage limit|out of credits|insufficient (credits|balance)/i.test(
+    message
+  );
+}
+
+/** Auth errors: the key is shared along a fallback chain, so another model
+ * would fail the same way. */
+export function isAuthError(message: string): boolean {
+  return / 40[13][:\s]|unauthori[sz]ed|invalid (api )?key|forbidden/i.test(message);
+}
+
 export async function runAgent(opts: {
   agentName: string;
   providerName: string;
@@ -655,6 +705,9 @@ export async function runAgent(opts: {
   /** One-click fixes (issue #22): when true the model is asked for full
    * replacement lines per finding. Rendered as ```suggestion blocks. */
   suggestFixes?: boolean;
+  /** Set by runAgentWithFallback when another model follows this one:
+   * model-level errors then skip the remaining retries (issue #101). */
+  failFastOnModelError?: boolean;
 }): Promise<AgentResult> {
   const synth = opts.priorFindings !== undefined;
   const incremental = opts.priorReview !== undefined;
@@ -771,16 +824,22 @@ export async function runAgent(opts: {
       lastError = (e as Error).message;
       raw = "";
     }
+    // With a fallback model waiting, a retired/unknown/out-of-quota model is
+    // not worth retrying even when the gateway reports it as a 5xx: hand over
+    // now (issue #101). Without one, keep retrying as before: some gateways
+    // word a short overload as "model unavailable".
+    if (opts.failFastOnModelError && isModelLevelError(lastError)) break;
     if (attempt < maxAttempts && isRetryableError(lastError)) {
       if (lastError.startsWith("empty content")) {
         if (emptyRetries >= 1) break; // deterministic: one retry is enough
         emptyRetries++;
       }
       // Don't sleep past the budget: the next iteration re-checks it anyway.
+      const wantMs = retryBackoffMs(lastError, attempt);
       const backoffMs =
         opts.deadlineAt === undefined
-          ? 2000 * attempt
-          : Math.max(0, Math.min(2000 * attempt, opts.deadlineAt - Date.now()));
+          ? wantMs
+          : Math.max(0, Math.min(wantMs, opts.deadlineAt - Date.now()));
       if (opts.deadlineAt !== undefined && Date.now() + backoffMs >= opts.deadlineAt) {
         logWarning(`Agent ${opts.agentName}: no time left for a retry after attempt ${attempt}.`);
         break;
@@ -819,7 +878,8 @@ export async function runAgent(opts: {
       spentAny ? { ...spent } : null,
       seconds,
       startedAt,
-      endedAt
+      endedAt,
+      lastError
     );
   }
   const parsed = extractReviewJson(raw);
@@ -867,6 +927,123 @@ export async function runAgent(opts: {
       `Agent ${opts.agentName}: findings validation failed (${(e as Error).message}); raw head: ${raw.slice(0, 200)}`
     );
     return { findings: [], usage, seconds, attempts: attemptsMade, startedAt, endedAt, outcome: "unparseable" };
+  }
+}
+
+/** One model's share of an agent run along a fallback chain (issue #101). */
+export type ModelLeg = {
+  model: string;
+  usage: Usage;
+  seconds: number;
+  attempts: number;
+  startedAt: number;
+  endedAt: number;
+  /** Why this model was left for the next one; absent on the answering leg. */
+  error?: string;
+};
+
+export type ChainResult = AgentResult & {
+  /** Model that produced the result. */
+  model: string;
+  /** Every model tried, in order (one entry when no fallback happened). */
+  legs: ModelLeg[];
+};
+
+/** Thrown when every model in a chain of 2+ failed; carries every leg's spend. */
+export class ChainFailedError extends AgentFailedError {
+  constructor(message: string, readonly legs: ModelLeg[], lastError: string) {
+    const known = legs.filter((l) => l.usage);
+    super(
+      message,
+      legs.reduce((n, l) => n + l.attempts, 0),
+      known.length
+        ? { in: known.reduce((n, l) => n + l.usage!.in, 0), out: known.reduce((n, l) => n + l.usage!.out, 0) }
+        : null,
+      legs.reduce((n, l) => n + l.seconds, 0),
+      legs[0]?.startedAt ?? Date.now(),
+      legs[legs.length - 1]?.endedAt ?? Date.now(),
+      lastError
+    );
+    this.name = "ChainFailedError";
+  }
+}
+
+/** The ordered models an agent may use: the configured one, then each
+ * `fallback_models` step merged over it. Transport and key stay fixed; a step
+ * only replaces the per-model knobs it sets. */
+export function modelChain(provider: ProviderConfig): ProviderConfig[] {
+  const { fallback_models, ...head } = provider;
+  const chain: ProviderConfig[] = [head as ProviderConfig];
+  for (const step of fallback_models ?? []) {
+    const o = typeof step === "string" ? { model: step } : step;
+    const next: Record<string, unknown> = { ...head };
+    for (const [k, v] of Object.entries(o)) if (v !== undefined) next[k] = v;
+    chain.push(next as unknown as ProviderConfig);
+  }
+  return chain;
+}
+
+/** Whether a failed model hands over to the next one: model-level errors
+ * (retired, unknown, out of quota) and transient errors that outlasted the
+ * model's retries. Never auth errors (the key is shared along the chain) and
+ * never an exhausted run budget (empty lastError). */
+export function shouldFallBack(lastError: string): boolean {
+  if (!lastError) return false;
+  if (isModelLevelError(lastError)) return true;
+  if (isAuthError(lastError)) return false;
+  return isRetryableError(lastError);
+}
+
+/**
+ * runAgent along the provider's fallback chain (issue #101). With no
+ * `fallback_models` it is exactly runAgent (same result, same errors).
+ * Otherwise a model that fails with a model-level or still-transient error
+ * hands over to the next one. The run's `deadlineAt` bounds the whole chain,
+ * not each model. Results that came back (even unparseable or empty) are
+ * returned as they are: only failures move down the chain.
+ */
+export async function runAgentWithFallback(
+  opts: Parameters<typeof runAgent>[0],
+  run: typeof runAgent = runAgent
+): Promise<ChainResult> {
+  const chain = modelChain(opts.provider);
+  const legs: ModelLeg[] = [];
+  for (let i = 0; ; i++) {
+    const p = chain[i];
+    try {
+      const r = await run({ ...opts, provider: p, failFastOnModelError: i + 1 < chain.length });
+      legs.push({
+        model: p.model, usage: r.usage, seconds: r.seconds, attempts: r.attempts,
+        startedAt: r.startedAt, endedAt: r.endedAt,
+      });
+      return { ...r, model: p.model, legs };
+    } catch (e) {
+      const failed = e instanceof AgentFailedError ? e : null;
+      const lastError = failed?.lastError || (e as Error).message;
+      const now = Date.now();
+      legs.push({
+        model: p.model,
+        usage: failed?.usageTotal ? { ...failed.usageTotal } : null,
+        seconds: failed?.seconds ?? 0,
+        attempts: failed?.attempts ?? 1,
+        startedAt: failed?.startedAt ?? now,
+        endedAt: failed?.endedAt ?? now,
+        error: lastError.slice(0, 200),
+      });
+      const next = chain[i + 1];
+      const timeLeft = opts.deadlineAt === undefined || Date.now() < opts.deadlineAt;
+      if (!next || !timeLeft || !shouldFallBack(lastError)) {
+        if (chain.length === 1) throw e;
+        throw new ChainFailedError(
+          `${(e as Error).message} (models tried: ${legs.map((l) => l.model).join(" → ")})`,
+          legs,
+          lastError
+        );
+      }
+      logWarning(
+        `Agent ${opts.agentName}: ${p.model} failed (${lastError.slice(0, 160)}); falling back to ${next.model}`
+      );
+    }
   }
 }
 
@@ -955,7 +1132,7 @@ export async function runTextAgent(opts: {
         emptyRetries++;
       }
       logWarning(`Agent ${opts.agentName}: attempt ${attempt}/${maxAttempts} failed (${lastError.slice(0, 160)}); retrying`);
-      await sleep(Math.min(2000 * attempt, 8000));
+      await sleep(Math.min(retryBackoffMs(lastError, attempt), lastError.includes("(retry-after ") ? MAX_RETRY_AFTER_MS : 8000));
     } else if (attempt < maxAttempts) {
       break;
     }
@@ -970,7 +1147,8 @@ export async function runTextAgent(opts: {
       usage,
       seconds,
       started,
-      endedAt
+      endedAt,
+      lastError
     );
   }
   logInfo(`Agent ${opts.agentName}: answered in ${seconds.toFixed(1)}s`);

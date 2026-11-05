@@ -19,6 +19,23 @@ export const AuthConfig = z.object({
 });
 export type AuthConfig = z.infer<typeof AuthConfig>;
 
+// One step of a provider's fallback chain (issue #101): a bare model id, or a
+// model plus the per-model knobs that differ between models (reasoning caps in
+// extra_body, json_mode support, retry/timeout budget). Transport and
+// credential always come from the entry that owns the chain: switching models
+// is the point, switching keys is not.
+export const FallbackModel = z.union([
+  z.string().min(1),
+  z.object({
+    model: z.string().min(1),
+    retries: z.number().int().min(0).max(5).optional(),
+    timeout_s: z.number().int().min(10).max(600).optional(),
+    json_mode: z.boolean().optional(),
+    extra_body: z.record(z.unknown()).optional(),
+  }),
+]);
+export type FallbackModel = z.infer<typeof FallbackModel>;
+
 export const ProviderConfig = z.object({
   // Deprecated alias kept for back-compat; maps to protocol + default base_url.
   // Prefer the generic fields below: any provider works with base_url + key_from + model.
@@ -52,6 +69,9 @@ export const ProviderConfig = z.object({
   json_mode: z.boolean().default(true),
   // Extra JSON body fields merged into the request (provider-specific params).
   extra_body: z.record(z.unknown()).default({}),
+  // Models tried in order when this one is unavailable or keeps failing
+  // (issue #101). Absent = today's behavior: one model, fail after retries.
+  fallback_models: z.array(FallbackModel).max(5).optional(),
   // Named per-model overrides sharing this entry's transport + credential
   // (issue #67): `provider: opencode.flash` merges `{...opencode,
   // ...opencode.models.flash}`. Every field optional with NO defaults, so an
@@ -71,6 +91,7 @@ export const ProviderConfig = z.object({
     timeout_s: z.number().int().min(10).max(600).optional(),
     json_mode: z.boolean().optional(),
     extra_body: z.record(z.unknown()).optional(),
+    fallback_models: z.array(FallbackModel).max(5).optional(),
   })).default({}),
 });
 export type ProviderConfig = z.infer<typeof ProviderConfig>;

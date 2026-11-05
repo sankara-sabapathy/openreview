@@ -36,6 +36,7 @@ providers:
     # extra_body: { temperature: 0.1 }     # merged into request JSON
     # retries: 2                           # retry budget for empty/5xx/429/network (0-5)
     # timeout_s: 420                       # per-attempt TOTAL cap, seconds (idle 90s + trickle 60s/1KB guards)
+    # fallback_models: [kimi-k2.7-code]    # tried in order when this model fails (see Model fallback)
     # models:                              # named per-model overrides sharing this transport + credential
     #   flash: { model: deepseek-v4-flash }# agents address them as `go.flash`;
     #   strict:                            # entries merge over the base — only set keys win
@@ -99,6 +100,43 @@ An empty-but-successful response is retried once, not `retries` times: a model
 that keeps answering in a field we don't read will do so on attempt 3 too, and
 each attempt costs real wall-clock. Raise `retries` for genuinely transient
 failures (5xx, 429, transport).
+
+## Model fallback
+
+Free and preview models are retired without notice. `fallback_models` lists up
+to 5 models to try, in order, on the same `base_url` and key:
+
+```yaml
+providers:
+  go:
+    protocol: openai-chat
+    model: cat-jam-free
+    base_url: https://opencode.ai/zen/go/v1
+    key_from: secrets.OPENCODE_API_KEY
+    extra_body: { reasoning_effort: "low" }
+    fallback_models:
+      - glm-5.3-flash                                  # bare id: inherits everything else
+      - { model: deepseek-v4.1-flash, json_mode: true, extra_body: { max_tokens: 8000 } }
+```
+
+- **When it moves on:** at once on a model-level error (model unavailable, not
+  found or unsupported, HTTP 402, quota or usage limit), or after the model's
+  `retries` are spent on a transient error (5xx, 429, timeout, network).
+- **When it does not:** auth errors (401/403) fail as before, because the key is
+  shared. A reply that came back but could not be parsed is not a failure and
+  does not fall back.
+- **Steps** override only `retries`, `timeout_s`, `json_mode` and `extra_body`;
+  a step's `extra_body` replaces the base's instead of merging into it.
+- **Budget:** `defaults.max_runtime_s` covers the whole chain; no model starts
+  once it is spent. The last model in the chain keeps its full retries.
+- **Visibility:** findings name the model that answered, the agents table shows
+  `first → next (why first failed)`, and the Models footer lists every model
+  that spent tokens.
+- A `models.<name>` entry inherits the base chain; set `fallback_models: []` on
+  it to turn the chain off for that entry.
+
+On a 429 or 503 that sends `Retry-After`, the retry waits that long (capped at
+60s, and never past the run budget) instead of the fixed 2s steps.
 
 ## Noise controls (profiles)
 

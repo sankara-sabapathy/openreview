@@ -21,7 +21,7 @@ import { parseArgs } from "node:util";
 import * as YAML from "yaml";
 import { parseConfig, type OpenReviewConfig } from "./config.js";
 import { templateContextFor, resolveExtends, mergeConfigs, parseConfigLoose } from "./templates.js";
-import { resolveKeysFromEnv, runAgent, resolveDottedProvider, assertProviderRefs, type Finding, type AgentOutcome } from "./providers.js";
+import { resolveKeysFromEnv, runAgentWithFallback, resolveDottedProvider, assertProviderRefs, type Finding, type AgentOutcome } from "./providers.js";
 import { matchesAny, filterIgnored, dedupeFindings, resolveNoise, applyNoiseControls, splitDiff, scopeDiff } from "./reviewer.js";
 import { buildContextBlock, buildRepoIndex } from "./context.js";
 import { runPooled } from "./main.js";
@@ -90,7 +90,7 @@ async function reviewCase(config: OpenReviewConfig, caseDir: string, id: string,
       const t0 = Date.now();
       try {
         const provider = config.providers[a.provider] ?? resolveDottedProvider(config.providers, a.provider).config;
-        const r = await runAgent({
+        const r = await runAgentWithFallback({
           agentName: a.name, providerName: a.provider, provider, instructions: a.instructions,
           diff: scopedDiff, lang: config.defaults.lang ?? "en", keys,
           maxDiffChars: config.defaults.max_diff_chars ?? 80000, sessionId, contextBlock, deadlineAt,

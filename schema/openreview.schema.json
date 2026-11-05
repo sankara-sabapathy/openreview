@@ -57,6 +57,7 @@
           "retries": { "type": "integer", "minimum": 0, "maximum": 5 },
           "timeout_s": { "type": "integer", "minimum": 10, "maximum": 600, "description": "Per-attempt total cap in seconds (default 420); 90s idle + 60s/1KB trickle guards kill dead hangs regardless." },
           "extra_body": { "type": "object" },
+          "fallback_models": { "$ref": "#/definitions/fallback_models" },
           "models": {
             "type": "object",
             "description": "Named per-model overrides sharing this entry's transport + credential. Agents address them as provider.entry.",
@@ -74,7 +75,8 @@
                 "json_mode": { "type": "boolean" },
                 "retries": { "type": "integer", "minimum": 0, "maximum": 5 },
                 "timeout_s": { "type": "integer", "minimum": 10, "maximum": 600 },
-                "extra_body": { "type": "object" }
+                "extra_body": { "type": "object" },
+                "fallback_models": { "$ref": "#/definitions/fallback_models" }
               }
             }
           }
@@ -127,6 +129,27 @@
     }
   },
   "definitions": {
+    "fallback_models": {
+      "type": "array",
+      "maxItems": 5,
+      "description": "Models tried in order when this one is unavailable, out of quota, or still failing after its retries. Same transport and key; auth errors never fall back.",
+      "items": {
+        "oneOf": [
+          { "type": "string", "minLength": 1 },
+          {
+            "type": "object",
+            "required": ["model"],
+            "properties": {
+              "model": { "type": "string", "minLength": 1 },
+              "retries": { "type": "integer", "minimum": 0, "maximum": 5 },
+              "timeout_s": { "type": "integer", "minimum": 10, "maximum": 600 },
+              "json_mode": { "type": "boolean" },
+              "extra_body": { "type": "object" }
+            }
+          }
+        ]
+      }
+    },
     "agent": {
       "type": "object",
       "required": ["provider", "instructions"],

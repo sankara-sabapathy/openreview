@@ -44495,6 +44495,21 @@ const AuthConfig = objectType({
     // Scheme prefix, e.g. "Bearer". "" sends the raw key (Azure api-key style).
     scheme: stringType().default("Bearer"),
 });
+// One step of a provider's fallback chain (issue #101): a bare model id, or a
+// model plus the per-model knobs that differ between models (reasoning caps in
+// extra_body, json_mode support, retry/timeout budget). Transport and
+// credential always come from the entry that owns the chain: switching models
+// is the point, switching keys is not.
+const FallbackModel = unionType([
+    stringType().min(1),
+    objectType({
+        model: stringType().min(1),
+        retries: numberType().int().min(0).max(5).optional(),
+        timeout_s: numberType().int().min(10).max(600).optional(),
+        json_mode: booleanType().optional(),
+        extra_body: recordType(unknownType()).optional(),
+    }),
+]);
 const ProviderConfig = objectType({
     // Deprecated alias kept for back-compat; maps to protocol + default base_url.
     // Prefer the generic fields below: any provider works with base_url + key_from + model.
@@ -44528,6 +44543,9 @@ const ProviderConfig = objectType({
     json_mode: booleanType().default(true),
     // Extra JSON body fields merged into the request (provider-specific params).
     extra_body: recordType(unknownType()).default({}),
+    // Models tried in order when this one is unavailable or keeps failing
+    // (issue #101). Absent = today's behavior: one model, fail after retries.
+    fallback_models: arrayType(FallbackModel).max(5).optional(),
     // Named per-model overrides sharing this entry's transport + credential
     // (issue #67): `provider: opencode.flash` merges `{...opencode,
     // ...opencode.models.flash}`. Every field optional with NO defaults, so an
@@ -44547,6 +44565,7 @@ const ProviderConfig = objectType({
         timeout_s: numberType().int().min(10).max(600).optional(),
         json_mode: booleanType().optional(),
         extra_body: recordType(unknownType()).optional(),
+        fallback_models: arrayType(FallbackModel).max(5).optional(),
     })).default({}),
 });
 const AgentConfig = objectType({
@@ -45686,13 +45705,17 @@ class AgentFailedError extends Error {
     seconds;
     startedAt;
     endedAt;
-    constructor(message, attempts, usageTotal, seconds, startedAt, endedAt) {
+    lastError;
+    constructor(message, attempts, usageTotal, seconds, startedAt, endedAt, 
+    /** The last attempt's raw error, so a fallback chain can classify it. */
+    lastError = "") {
         super(message);
         this.attempts = attempts;
         this.usageTotal = usageTotal;
         this.seconds = seconds;
         this.startedAt = startedAt;
         this.endedAt = endedAt;
+        this.lastError = lastError;
         this.name = "AgentFailedError";
     }
 }
@@ -45722,7 +45745,7 @@ async function callAnthropic(opts) {
         // Idle 90s: streaming (slow) responses survive, dead hangs die fast.
         const text = await readBodyWithIdleTimeout(res, 90000, "anthropic");
         if (!res.ok)
-            throw new Error(`anthropic ${res.status}: ${text}`);
+            throw new Error(`anthropic ${res.status}${retryAfterNote(res)}: ${text}`);
         const j = JSON.parse(text);
         const out = (j.content ?? [])
             .filter((b) => b.type === "text")
@@ -45844,7 +45867,7 @@ async function callOpenAICompatible(opts) {
         // Idle 90s: streaming (slow) responses survive, dead hangs die fast.
         const text = await readBodyWithIdleTimeout(res, 90000, "llm");
         if (!res.ok)
-            throw new Error(`llm ${base} ${res.status}: ${text}`);
+            throw new Error(`llm ${base} ${res.status}${retryAfterNote(res)}: ${text}`);
         const j = JSON.parse(text);
         const u = j.usage ?? {};
         const usage = typeof u.prompt_tokens === "number" || typeof u.completion_tokens === "number"
@@ -45980,6 +46003,51 @@ function sleep(ms) {
 function isRetryableError(message) {
     return /empty (content|response)|timeout after|idle timeout|trickle timeout| 429[:\s]| 5\d\d[:\s]|fetch failed|timeout|ECONNRESET|ENOTFOUND|socket hang up/i.test(message);
 }
+/** ` (retry-after Ns)` when a 429/503 names a wait, else "". Kept in the
+ * error text so the retry loop can honor it without threading headers. */
+function retryAfterNote(res) {
+    if (res.status !== 429 && res.status !== 503)
+        return "";
+    const s = parseRetryAfter(res.headers?.get("retry-after") ?? null, Date.now());
+    return s === null ? "" : ` (retry-after ${s}s)`;
+}
+/** Retry-After as whole seconds: delta-seconds or an HTTP date. Null when absent or unparseable. */
+function parseRetryAfter(value, now) {
+    if (!value)
+        return null;
+    const v = value.trim();
+    if (/^\d+$/.test(v))
+        return Number(v);
+    const at = Date.parse(v);
+    if (Number.isNaN(at))
+        return null;
+    return Math.max(0, Math.ceil((at - now) / 1000));
+}
+/** Upper bound on one Retry-After wait; past this a fallback model or the
+ * next run is the better use of the budget. */
+const MAX_RETRY_AFTER_MS = 60_000;
+/** Backoff before retry `attempt`: linear 2s steps, raised to the provider's
+ * Retry-After when it named one (capped at 60s). Callers still clamp to the
+ * run deadline. */
+function retryBackoffMs(lastError, attempt) {
+    const base = 2000 * attempt;
+    const m = /\(retry-after (\d+)s\)/.exec(lastError);
+    if (!m)
+        return base;
+    return Math.max(base, Math.min(Number(m[1]) * 1000, MAX_RETRY_AFTER_MS));
+}
+/** Errors about the MODEL rather than the request or the key (issue #101):
+ * retired, paused, unknown or not served, or out of quota/usage for it. The
+ * same model will not recover within a run, so retries are skipped and a
+ * fallback model (when configured) is tried instead. */
+function isModelLevelError(message) {
+    return /\bmodel\b[^.\n]{0,40}?\b(is )?(unavailable|not (found|available|supported)|does not exist|deprecated|retired|disabled)|\b(unknown|invalid|unsupported|no such) model\b|model_not_found| 402[:\s]|payment required|insufficient[_ ]quota|quota (exceeded|exhausted)|usage limit|out of credits|insufficient (credits|balance)/i.test(message);
+}
+/** Auth errors: the key is shared along a fallback chain, so another model
+ * would fail the same way. */
+function isAuthError(message) {
+    return / 40[13][:\s]|unauthori[sz]ed|invalid (api )?key|forbidden/i.test(message);
+}
 async function runAgent(opts) {
     const synth = opts.priorFindings !== undefined;
     const incremental = opts.priorReview !== undefined;
@@ -46099,6 +46167,12 @@ async function runAgent(opts) {
             lastError = e.message;
             raw = "";
         }
+        // With a fallback model waiting, a retired/unknown/out-of-quota model is
+        // not worth retrying even when the gateway reports it as a 5xx: hand over
+        // now (issue #101). Without one, keep retrying as before: some gateways
+        // word a short overload as "model unavailable".
+        if (opts.failFastOnModelError && isModelLevelError(lastError))
+            break;
         if (attempt < maxAttempts && isRetryableError(lastError)) {
             if (lastError.startsWith("empty content")) {
                 if (emptyRetries >= 1)
@@ -46106,9 +46180,10 @@ async function runAgent(opts) {
                 emptyRetries++;
             }
             // Don't sleep past the budget: the next iteration re-checks it anyway.
+            const wantMs = retryBackoffMs(lastError, attempt);
             const backoffMs = opts.deadlineAt === undefined
-                ? 2000 * attempt
-                : Math.max(0, Math.min(2000 * attempt, opts.deadlineAt - Date.now()));
+                ? wantMs
+                : Math.max(0, Math.min(wantMs, opts.deadlineAt - Date.now()));
             if (opts.deadlineAt !== undefined && Date.now() + backoffMs >= opts.deadlineAt) {
                 logWarning(`Agent ${opts.agentName}: no time left for a retry after attempt ${attempt}.`);
                 break;
@@ -46138,7 +46213,7 @@ async function runAgent(opts) {
         // undiagnosable from the outside without this. The spend rides along on
         // the error so the footer can still account for it (issue #52).
         throw new AgentFailedError(`Agent ${opts.agentName} failed after ${attemptsMade} attempt(s): ${lastError || "run budget exhausted"}` +
-            (lastShape ? ` [response ${lastShape}]` : ""), attemptsMade, spentAny ? { ...spent } : null, seconds, startedAt, endedAt);
+            (lastShape ? ` [response ${lastShape}]` : ""), attemptsMade, spentAny ? { ...spent } : null, seconds, startedAt, endedAt, lastError);
     }
     const parsed = extractReviewJson(raw);
     if (!parsed) {
@@ -46182,6 +46257,92 @@ async function runAgent(opts) {
         // Validation of individual findings failed — warn, don't silently drop everything.
         logWarning(`Agent ${opts.agentName}: findings validation failed (${e.message}); raw head: ${raw.slice(0, 200)}`);
         return { findings: [], usage, seconds, attempts: attemptsMade, startedAt, endedAt, outcome: "unparseable" };
+    }
+}
+/** Thrown when every model in a chain of 2+ failed; carries every leg's spend. */
+class ChainFailedError extends AgentFailedError {
+    legs;
+    constructor(message, legs, lastError) {
+        const known = legs.filter((l) => l.usage);
+        super(message, legs.reduce((n, l) => n + l.attempts, 0), known.length
+            ? { in: known.reduce((n, l) => n + l.usage.in, 0), out: known.reduce((n, l) => n + l.usage.out, 0) }
+            : null, legs.reduce((n, l) => n + l.seconds, 0), legs[0]?.startedAt ?? Date.now(), legs[legs.length - 1]?.endedAt ?? Date.now(), lastError);
+        this.legs = legs;
+        this.name = "ChainFailedError";
+    }
+}
+/** The ordered models an agent may use: the configured one, then each
+ * `fallback_models` step merged over it. Transport and key stay fixed; a step
+ * only replaces the per-model knobs it sets. */
+function modelChain(provider) {
+    const { fallback_models, ...head } = provider;
+    const chain = [head];
+    for (const step of fallback_models ?? []) {
+        const o = typeof step === "string" ? { model: step } : step;
+        const next = { ...head };
+        for (const [k, v] of Object.entries(o))
+            if (v !== undefined)
+                next[k] = v;
+        chain.push(next);
+    }
+    return chain;
+}
+/** Whether a failed model hands over to the next one: model-level errors
+ * (retired, unknown, out of quota) and transient errors that outlasted the
+ * model's retries. Never auth errors (the key is shared along the chain) and
+ * never an exhausted run budget (empty lastError). */
+function shouldFallBack(lastError) {
+    if (!lastError)
+        return false;
+    if (isModelLevelError(lastError))
+        return true;
+    if (isAuthError(lastError))
+        return false;
+    return isRetryableError(lastError);
+}
+/**
+ * runAgent along the provider's fallback chain (issue #101). With no
+ * `fallback_models` it is exactly runAgent (same result, same errors).
+ * Otherwise a model that fails with a model-level or still-transient error
+ * hands over to the next one. The run's `deadlineAt` bounds the whole chain,
+ * not each model. Results that came back (even unparseable or empty) are
+ * returned as they are: only failures move down the chain.
+ */
+async function runAgentWithFallback(opts, run = runAgent) {
+    const chain = modelChain(opts.provider);
+    const legs = [];
+    for (let i = 0;; i++) {
+        const p = chain[i];
+        try {
+            const r = await run({ ...opts, provider: p, failFastOnModelError: i + 1 < chain.length });
+            legs.push({
+                model: p.model, usage: r.usage, seconds: r.seconds, attempts: r.attempts,
+                startedAt: r.startedAt, endedAt: r.endedAt,
+            });
+            return { ...r, model: p.model, legs };
+        }
+        catch (e) {
+            const failed = e instanceof AgentFailedError ? e : null;
+            const lastError = failed?.lastError || e.message;
+            const now = Date.now();
+            legs.push({
+                model: p.model,
+                usage: failed?.usageTotal ? { ...failed.usageTotal } : null,
+                seconds: failed?.seconds ?? 0,
+                attempts: failed?.attempts ?? 1,
+                startedAt: failed?.startedAt ?? now,
+                endedAt: failed?.endedAt ?? now,
+                error: lastError.slice(0, 200),
+            });
+            const next = chain[i + 1];
+            const timeLeft = opts.deadlineAt === undefined || Date.now() < opts.deadlineAt;
+            if (!next || !timeLeft || !shouldFallBack(lastError)) {
+                if (chain.length === 1)
+                    throw e;
+                throw new ChainFailedError(`${e.message} (models tried: ${legs.map((l) => l.model).join(" → ")})`, legs, lastError);
+            }
+            logWarning(`Agent ${opts.agentName}: ${p.model} failed (${lastError.slice(0, 160)}); falling back to ${next.model}`);
+        }
     }
 }
 async function runTextAgent(opts) {
@@ -46247,7 +46408,7 @@ async function runTextAgent(opts) {
                 emptyRetries++;
             }
             logWarning(`Agent ${opts.agentName}: attempt ${attempt}/${maxAttempts} failed (${lastError.slice(0, 160)}); retrying`);
-            await sleep(Math.min(2000 * attempt, 8000));
+            await sleep(Math.min(retryBackoffMs(lastError, attempt), lastError.includes("(retry-after ") ? MAX_RETRY_AFTER_MS : 8000));
         }
         else if (attempt < maxAttempts) {
             break;
@@ -46257,7 +46418,7 @@ async function runTextAgent(opts) {
     const endedAt = Date.now();
     const usage = spentAny ? { ...spent } : null;
     if (!raw.trim()) {
-        throw new AgentFailedError(`Agent ${opts.agentName} failed after ${attemptsMade} attempt(s): ${lastError || "run budget exhausted"}`, attemptsMade, usage, seconds, started, endedAt);
+        throw new AgentFailedError(`Agent ${opts.agentName} failed after ${attemptsMade} attempt(s): ${lastError || "run budget exhausted"}`, attemptsMade, usage, seconds, started, endedAt, lastError);
     }
     logInfo(`Agent ${opts.agentName}: answered in ${seconds.toFixed(1)}s`);
     return { text: raw.trim(), usage, seconds, attempts: attemptsMade, startedAt: started, endedAt: endedAt, outcome: "ok" };
@@ -47271,7 +47432,7 @@ function renderRunBody(opts) {
         lines.push("| Agent | Provider | Outcome | Time |");
         lines.push("|---|---|---|---|");
         for (const a of agents) {
-            lines.push(`| ${a.agent} | ${a.provider} | ${OUTCOME_LABEL[a.outcome] ?? a.outcome} | ${a.seconds.toFixed(1)}s |`);
+            lines.push(`| ${a.agent} | ${a.provider}${a.fallback ? `<br><sub>fallback: ${cell(sanitizeErrorDetail(a.fallback, 160), 160).replace(/</g, "&lt;").replace(/>/g, "&gt;")}</sub>` : ""} | ${OUTCOME_LABEL[a.outcome] ?? a.outcome} | ${a.seconds.toFixed(1)}s |`);
         }
         lines.push("");
         lines.push("</details>");
@@ -48320,6 +48481,19 @@ async function getIncrementalDiff(octokit, owner, repo, pr, base, head) {
         logWarning(`PR head moved during incremental diff fetch (${head.slice(0, 7)} -> ${freshSha.slice(0, 7)}); aborting - a fresh review runs on the new head.`);
     return { fileNames: names, diff: parts.join("\n\n"), headSha: freshSha, omitted, truncated, totalFiles: files.length, stale };
 }
+/** Sticky note for an agent that moved down its fallback chain (issue #101):
+ * `a → b (why a failed)`. Undefined when the first model answered alone. */
+function describeFallback(legs) {
+    if (!legs || legs.length < 2)
+        return undefined;
+    const why = legs[0].error ? ` (${firstLine(legs[0].error).slice(0, 80)})` : "";
+    return `${legs.map((l) => l.model).join(" → ")}${why}`;
+}
+function firstLine(s) {
+    // Provider bodies are JSON; prefer the human message inside when present.
+    const m = /"message"\s*:\s*"([^"]{1,200})"/.exec(s);
+    return (m ? m[1] : s).split("\n")[0];
+}
 /**
  * Footer lines for the sticky (issue #52). Models line groups true spend by
  * model with wall-clock throughput; agents line shows each agent's own spend
@@ -48787,7 +48961,7 @@ async function run() {
                     }
                 }
                 const p = provider;
-                return (priorFindings) => runAgent({
+                return (priorFindings) => runAgentWithFallback({
                     agentName: a.name,
                     providerName: a.provider,
                     provider: p,
@@ -48815,8 +48989,9 @@ async function run() {
                     outcome: result.outcome,
                     agent: a.name,
                     providerName: a.provider,
-                    model: p.model,
+                    model: result.model,
                     synthesis: result.synthesis,
+                    legs: result.legs,
                 }))
                     .catch((e) => {
                     const msg = e.message;
@@ -48840,6 +49015,7 @@ async function run() {
                         agent: a.name,
                         providerName: a.provider,
                         model: p.model,
+                        legs: e instanceof ChainFailedError ? e.legs : undefined,
                     };
                 });
             };
@@ -49000,6 +49176,7 @@ async function run() {
                     providerName: r.providerName,
                     outcome: r.outcome,
                     seconds: r.seconds,
+                    fallback: describeFallback(r.legs),
                 })),
                 usage: results
                     // Every agent that started an attempt is accounted for (issue #52):
@@ -49007,17 +49184,32 @@ async function run() {
                     // never started (no key, no budget left) are absent — and those are
                     // named separately in the skipped-key warning below.
                     .filter((r) => r.attempts > 0)
-                    .map((r) => ({
-                    agent: r.agent,
-                    // Resolved model travels with the result: dotted refs
-                    // (`opencode.flash`) have no top-level entry to look up (issue #67).
-                    model: r.model,
-                    usage: r.usage,
-                    seconds: r.seconds,
-                    attempts: r.attempts,
-                    startedAt: r.startedAt,
-                    endedAt: r.endedAt,
-                })),
+                    .flatMap((r) => 
+                // A fallback chain spent on every model it tried (issue #101):
+                // one record per leg so the Models footer names each of them.
+                r.legs && r.legs.length > 1
+                    ? r.legs
+                        .filter((l) => l.attempts > 0)
+                        .map((l) => ({
+                        agent: r.agent,
+                        model: l.model,
+                        usage: l.usage,
+                        seconds: l.seconds,
+                        attempts: l.attempts,
+                        startedAt: l.startedAt,
+                        endedAt: l.endedAt,
+                    }))
+                    : [{
+                            agent: r.agent,
+                            // Resolved model travels with the result: dotted refs
+                            // (`opencode.flash`) have no top-level entry to look up (issue #67).
+                            model: r.model,
+                            usage: r.usage,
+                            seconds: r.seconds,
+                            attempts: r.attempts,
+                            startedAt: r.startedAt,
+                            endedAt: r.endedAt,
+                        }]),
                 carried: carried.length > 0 ? carried : undefined,
                 ledger,
             });

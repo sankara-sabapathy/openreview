@@ -50,6 +50,11 @@ Usage beyond limits blocks unless **Use balance** (Zen credits) is enabled in th
 
 ## Free tier
 
+Free models disappear without notice, so pair one with a
+[`fallback_models`](../configuration.md#model-fallback) chain. When the free model
+answers "Model is unavailable", the review moves to the next model in the same
+run instead of failing.
+
 Go's free models change without notice: the table above was checked on
 2026-10-02, and `cat-jam-free` (used by this repo since 2026-10-15) appeared
 after it. For a PR on every push, free models are the sensible default
